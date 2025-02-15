@@ -520,7 +520,3 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
             return Response({"message": "No active cameras found.", "status": status.HTTP_503_SERVICE_UNAVAILABLE}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         return Response({"message": "All cameras feed path", "section_id": pk, "streams": active_streams, "status": status.HTTP_200_OK}, status=status.HTTP_200_OK)
-
-
-def camera_streams(request):
-    return render(request, 'cameras/camera_stream.html')

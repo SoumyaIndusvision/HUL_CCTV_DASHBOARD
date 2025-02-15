@@ -26,16 +26,38 @@ SECRET_KEY = 'django-insecure-6@cen74$wv(km$xjh95r#7v0#*ev)v6afj&lzzhkqtv6vfs2er
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-CORS_ALLOW_ALL_ORIGINS = True
+# CORS Configuration
+CORS_ALLOW_ALL_ORIGINS = False  # Security: Only allow specific origins
+CORS_ALLOW_CREDENTIALS = True  # Allow cookies & authorization headers
 
-CORS_ORIGIN_ALLOW_ALL=True
-
-CORS_ALLOW_CREDENTIALS = True
-
+# Allowed origins (frontend domains)
 CORS_ALLOWED_ORIGINS = [
-    'http://localhost:5173',
-    'https://cctv.indusvision.in',
-    'https://www.cctv.indusvision.in',
+    "http://localhost:5173",  # Local development frontend
+    "https://cctv.indusvision.in",  # Production frontend domain
+    "https://www.cctv.indusvision.in",  # Alternative production frontend
+]
+
+# Allow all standard HTTP methods
+CORS_ALLOW_METHODS = [
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+]
+
+# Allow standard headers needed for API communication
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "accept-encoding",
+    "authorization",
+    "content-type",
+    "dnt",
+    "origin",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
 ]
 
 ALLOWED_HOSTS = ['*','localhost', '127.0.0.1', 'cctv.indusvision.in', 'www.cctv.indusvision.in','cctv.localhost']
@@ -60,6 +82,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',

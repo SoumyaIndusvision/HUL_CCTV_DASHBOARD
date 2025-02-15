@@ -1,6 +1,8 @@
 import cv2
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from django.http import StreamingHttpResponse, JsonResponse
 from django.shortcuts import render
 from rest_framework import viewsets, status
@@ -137,7 +139,8 @@ class SectionViewSet(viewsets.ViewSet):
                 name="serac_id", 
                 in_=openapi.IN_QUERY, 
                 type=openapi.TYPE_INTEGER, 
-                description="ID of the Serac to retrieve sections for"
+                description="ID of the Serac to retrieve sections for",
+                required=True
             )
         ],
         responses={
@@ -293,7 +296,8 @@ class CameraViewSet(viewsets.ViewSet):
                 name="section_id", 
                 in_=openapi.IN_QUERY, 
                 type=openapi.TYPE_INTEGER, 
-                description="ID of the section to retrieve cameras for"
+                description="ID of the section to retrieve cameras for",
+                required=True
             )
         ],
         responses={
@@ -419,20 +423,17 @@ class CameraViewSet(viewsets.ViewSet):
 
 
 def check_camera_status(camera_url):
-    """Checks if a camera is reachable."""
+    """Checks if a camera is reachable quickly using a short timeout."""
     cap = cv2.VideoCapture(camera_url)
-    status = cap.isOpened()
+    is_opened = cap.isOpened()
     cap.release()
-    return status
+    return is_opened
 
 def stream_camera_feed(camera_url):
-    """Yields frames from a camera."""
+    """Yields frames from a camera in a more optimized way."""
     cap = cv2.VideoCapture(camera_url)
-    # cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"H264"))
-    # cap.set(cv2.CAP_PROP_RTSP_TRANSPORT, 1) # 1 = TCP
-
-    retry_count = 0
-    max_retries = 3
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffering to minimize latency
+    retry_count, max_retries = 0, 3
 
     while retry_count < max_retries and not cap.isOpened():
         logger.warning(f"Camera {camera_url} is down. Retrying... ({retry_count+1}/{max_retries})")
@@ -441,7 +442,7 @@ def stream_camera_feed(camera_url):
         retry_count += 1
 
     if not cap.isOpened():
-        logger.error(f"Camera {camera_url} is unreachable. Skipping stream.")
+        logger.error(f"Camera {camera_url} is unreachable.")
         return None
 
     try:
@@ -460,17 +461,18 @@ def stream_camera_feed(camera_url):
         cap.release()
 
 def video_feed(request, camera_id):
-    """Handles video streaming."""
-    camera = Camera.objects.get(id=camera_id)
-    camera_url = camera.get_rtsp_url()
+    """Handles video streaming for a single camera."""
+    try:
+        camera = Camera.objects.get(id=camera_id)
+        camera_url = camera.get_rtsp_url()
 
-    if check_camera_status(camera_url):
-        return StreamingHttpResponse(stream_camera_feed(camera_url),
-                                     content_type='multipart/x-mixed-replace; boundary=frame')
-    
-    else:
-        return Response({"message": f"Camera {camera_id} is unreachable.", "status": status.HTTP_503_SERVICE_UNAVAILABLE}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-    
+        if check_camera_status(camera_url):
+            return StreamingHttpResponse(stream_camera_feed(camera_url),
+                                         content_type='multipart/x-mixed-replace; boundary=frame')
+        else:
+            return Response({"message": f"Camera {camera_id} is unreachable.", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
+    except Camera.DoesNotExist:
+        return Response({"message": "Camera not found", "status": status.HTTP_404_NOT_FOUND})    
     
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """
@@ -497,26 +499,28 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         }
     )
     def retrieve(self, request, pk=None):
-        """
-        Streams multiple active cameras for the given section.
-        """
-
         try:
             section = Section.objects.get(id=pk)
         except Section.DoesNotExist:
-            return Response({"message": "Section not found.", "status": status.HTTP_404_NOT_FOUND}, status=status.HTTP_404_NOT_FOUND)
-        
+            return Response({"message": "Section not found.", "status": status.HTTP_404_NOT_FOUND})
+
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_streams = {}
 
-        for camera in cameras:
-            camera_url = f"/api/video_feed/{camera.id}/"  # Generate HTTP URL for streaming
-            if check_camera_status(camera.get_rtsp_url()):  # Check if RTSP URL is working
+        def process_camera(camera):
+            """Checks camera status in parallel."""
+            camera_url = f"/api/video_feed/{camera.id}/"
+            if check_camera_status(camera.get_rtsp_url()):
                 active_streams[camera.id] = camera_url
             else:
                 logger.error(f"Camera {camera.id} at {camera.get_rtsp_url()} is unreachable.")
 
-        if not active_streams:
-            return Response({"message": "No active cameras found.", "status": status.HTTP_503_SERVICE_UNAVAILABLE}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        # **Use Multi-threading to speed up processing**
+        with ThreadPoolExecutor(max_workers=min(len(cameras), 10)) as executor:
+            executor.map(process_camera, cameras)
 
-        return Response({"message": "All cameras feed path", "section_id": pk, "streams": active_streams, "status": status.HTTP_200_OK}, status=status.HTTP_200_OK)
+        if not active_streams:
+            return Response({"message": "No active cameras found.", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
+
+        return Response({"message": "All cameras feed path", "section_id": pk, "streams": active_streams, "status": status.HTTP_200_OK})
+

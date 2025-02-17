@@ -6,7 +6,7 @@ import numpy as np
 import subprocess
 import queue
 from collections import deque
-from multiprocessing import Process, Manager
+from multiprocessing import Process, Manager, Queue
 from concurrent.futures import ThreadPoolExecutor
 from django.http import StreamingHttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
@@ -429,7 +429,7 @@ class CameraViewSet(viewsets.ViewSet):
 stream_manager = Manager()
 active_streams = stream_manager.dict()  # Shared dictionary for FFmpeg processes
 frame_queues = stream_manager.dict()  # Shared dictionary for frame queues
-MAX_CONCURRENT_STREAMS = 10  # Adjust based on system resources
+MAX_CONCURRENT_STREAMS = 15  # Adjust based on system resources
 
 
 def stream_camera_ffmpeg(camera_id, camera_url):
@@ -442,7 +442,7 @@ def stream_camera_ffmpeg(camera_id, camera_url):
     if camera_id in active_streams:
         return  # Process already running
 
-    frame_queue = queue.Queue(maxsize=30)  # Prevent memory overload
+    frame_queue = Queue(maxsize=30)  # Prevent memory overload
     frame_queues[camera_id] = frame_queue
 
     try:

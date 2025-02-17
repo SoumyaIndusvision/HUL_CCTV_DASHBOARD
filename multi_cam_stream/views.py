@@ -424,16 +424,20 @@ class CameraViewSet(viewsets.ViewSet):
             return Response({"message": "Camera created", "status": status.HTTP_201_CREATED})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
+# Constants
+MAX_CONCURRENT_STREAMS = 15
+FRAME_TIMEOUT = 10  # Max time to wait for the first frame in seconds
+
 # Thread-safe storage for FFmpeg processes and frame queues
 active_streams = {}
 frame_queues = {}
 unresponsive_cameras = set()
 stream_lock = threading.Lock()
 
-# Limits
-MAX_CONCURRENT_STREAMS = 15
-FRAME_TIMEOUT = 10  # Max time to wait for the first frame in seconds
+# Set the maximum number of concurrent camera streams
+thread_pool_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
 
+# Stream handling and FFmpeg process
 def stream_camera_ffmpeg(camera_id, camera_url):
     """
     Starts an FFmpeg process to capture frames from the camera.
@@ -518,12 +522,11 @@ def video_feed(request, camera_id):
 
     with stream_lock:
         if camera_id not in active_streams:
-            threading.Thread(target=stream_camera_ffmpeg, args=(camera_id, camera.get_rtsp_url()), daemon=True).start()
+            thread_pool_executor.submit(stream_camera_ffmpeg, camera_id, camera.get_rtsp_url())
     
     # Return StreamingHttpResponse for the video feed
     return StreamingHttpResponse(generate_frames(camera_id),
                                  content_type='multipart/x-mixed-replace; boundary=frame')
-
 
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """
@@ -563,7 +566,7 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
                         unresponsive_camera_urls[camera.id] = "unresponsive"
                         return None  # Skip unresponsive camera
                     if camera.id not in active_streams:
-                        threading.Thread(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url()), daemon=True).start()
+                        thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
                     return {camera.id: f"/api/video_feed/{camera.id}/"}
             except Exception as e:
                 logger.error(f"Error processing camera {camera.id}: {e}")
@@ -571,12 +574,12 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
                 unresponsive_camera_urls[camera.id] = "unresponsive"
                 return None
 
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS) as executor:
-            futures = {executor.submit(process_camera, camera): camera.id for camera in cameras}
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    active_stream_urls.update(result)
+        # Using ThreadPoolExecutor to manage multiple camera streams
+        futures = [thread_pool_executor.submit(process_camera, camera) for camera in cameras]
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                active_stream_urls.update(result)
 
         # Prepare the response
         if not active_stream_urls and not unresponsive_camera_urls:
@@ -588,6 +591,9 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
             response_data["unresponsive_cameras"] = unresponsive_camera_urls
 
         return Response(response_data, status=status.HTTP_200_OK)
+    
+
+
 
 # # Store active FFmpeg processes
 # active_streams = {}

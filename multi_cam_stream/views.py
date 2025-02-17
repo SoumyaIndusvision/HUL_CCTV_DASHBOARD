@@ -527,6 +527,25 @@ def video_feed(request, camera_id):
     return StreamingHttpResponse(generate_frames(camera_id),
                                  content_type='multipart/x-mixed-replace; boundary=frame')
 
+def process_camera(camera):
+    """Launch camera stream process if not running."""
+    global unresponsive_cameras, active_streams
+    
+    try:
+        with stream_lock:
+            if camera.id in unresponsive_cameras:
+                return {camera.id: "unresponsive"}  # Mark as unresponsive
+            
+            if camera.id not in active_streams:
+                executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
+            
+        return {camera.id: f"/api/video_feed/{camera.id}/"}
+    
+    except Exception as e:
+        logger.error(f"Error processing camera {camera.id}: {e}")
+        unresponsive_cameras.add(camera.id)
+        return {camera.id: "unresponsive"}
+
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """
     ViewSet to stream multiple cameras for a specific section.
@@ -557,28 +576,16 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         active_stream_urls = {}
         unresponsive_camera_urls = {}
 
-        def process_camera(camera):
-            """Launch camera stream process if not running.""" 
-            try:
-                with stream_lock:
-                    if camera.id in unresponsive_cameras:
-                        unresponsive_camera_urls[camera.id] = "unresponsive"
-                        return None  # Skip unresponsive camera
-                    if camera.id not in active_streams:
-                        executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
-                    return {camera.id: f"/api/video_feed/{camera.id}/"}
-            except Exception as e:
-                logger.error(f"Error processing camera {camera.id}: {e}")
-                unresponsive_cameras.add(camera.id)
-                unresponsive_camera_urls[camera.id] = "unresponsive"
-                return None
-
         # Using ProcessPoolExecutor to manage multiple camera streams
         futures = [executor.submit(process_camera, camera) for camera in cameras]
+        
         for future in as_completed(futures):
             result = future.result()
             if result:
-                active_stream_urls.update(result)
+                if "unresponsive" in result.values():
+                    unresponsive_camera_urls.update(result)
+                else:
+                    active_stream_urls.update(result)
 
         return Response({"streams": active_stream_urls, "unresponsive_cameras": unresponsive_camera_urls}, status=status.HTTP_200_OK)
     

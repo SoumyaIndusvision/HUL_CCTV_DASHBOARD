@@ -425,8 +425,8 @@ class CameraViewSet(viewsets.ViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 # Constants
-MAX_CONCURRENT_STREAMS = 20
-FRAME_TIMEOUT = 30  # Max time to wait for the first frame in seconds
+MAX_CONCURRENT_STREAMS = 15  # Increase the concurrent streams limit
+FRAME_TIMEOUT = 20  # Max time to wait for the first frame in seconds
 
 # Thread-safe storage for FFmpeg processes and frame queues
 active_streams = {}
@@ -528,6 +528,13 @@ def video_feed(request, camera_id):
     return StreamingHttpResponse(generate_frames(camera_id),
                                  content_type='multipart/x-mixed-replace; boundary=frame')
 
+# Ensure that the executor is not shutdown before submitting tasks.
+def create_executor():
+    """Creates a new thread pool executor if necessary."""
+    global thread_pool_executor
+    if thread_pool_executor._shutdown:
+        thread_pool_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
+
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """
     ViewSet to stream multiple cameras for a specific section.
@@ -535,15 +542,15 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
     @swagger_auto_schema(
         operation_summary="Retrieve Active Camera Streams for a Section",
         operation_description="Fetches and returns active camera streams for the specified section.",
-        responses={
+        responses={ 
             200: openapi.Response(
                 description="Returns a list of active camera streams.",
-                examples={
-                    "application/json": {
-                        "streams": {
-                            "1": "/api/video_feed/1/",
-                            "2": "/api/video_feed/2/"
-                        }
+                examples={ 
+                    "application/json": { 
+                        "streams": { 
+                            "1": "/api/video_feed/1/", 
+                            "2": "/api/video_feed/2/" 
+                        } 
                     }
                 }
             ),
@@ -559,8 +566,10 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         unresponsive_camera_urls = {}
 
         def process_camera(camera):
-            """Launch camera stream process if not running."""
+            """Launch camera stream process if not running.""" 
             try:
+                create_executor()  # Ensure the thread pool is active
+
                 with stream_lock:
                     if camera.id in unresponsive_cameras:
                         unresponsive_camera_urls[camera.id] = "unresponsive"
@@ -590,8 +599,7 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         if unresponsive_camera_urls:
             response_data["unresponsive_cameras"] = unresponsive_camera_urls
 
-        return Response(response_data, status=status.HTTP_200_OK)
-    
+        return Response(response_data, status=status.HTTP_200_OK)    
 
 
 

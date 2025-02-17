@@ -433,7 +433,7 @@ def stream_camera_ffmpeg(camera_url, frame_queue):
             "-rtsp_transport", "tcp",
             "-i", camera_url,
             "-an",  # No audio
-            "-vf", "fps=10,scale=320:240",  # Optimize frame rate & scale for better performance
+            "-vf", "fps=7,scale=640:480",  # Optimize frame rate & scale for better performance
             "-f", "image2pipe",
             "-pix_fmt", "bgr24",  
             "-vcodec", "rawvideo",
@@ -463,7 +463,7 @@ def stream_camera_ffmpeg(camera_url, frame_queue):
 
 def generate_frames(camera_url):
     """Generator function to yield frames for smooth streaming."""
-    frame_queue = Queue(maxsize=50)  # Prevent memory overload
+    frame_queue = Queue(maxsize=10)  # Prevent memory overload
     process = Process(target=stream_camera_ffmpeg, args=(camera_url, frame_queue))
     process.start()
 

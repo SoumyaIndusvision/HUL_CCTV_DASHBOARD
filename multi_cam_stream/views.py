@@ -425,8 +425,8 @@ class CameraViewSet(viewsets.ViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 # Constants
-MAX_CONCURRENT_STREAMS = 15
-FRAME_TIMEOUT = 10  # Max time to wait for the first frame in seconds
+MAX_CONCURRENT_STREAMS = 20
+FRAME_TIMEOUT = 30  # Max time to wait for the first frame in seconds
 
 # Thread-safe storage for FFmpeg processes and frame queues
 active_streams = {}

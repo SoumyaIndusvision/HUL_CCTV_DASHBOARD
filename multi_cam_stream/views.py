@@ -424,46 +424,55 @@ class CameraViewSet(viewsets.ViewSet):
             return Response({"message": "Camera created", "status": status.HTTP_201_CREATED})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+# Store active FFmpeg processes
+active_streams = {}
+
 def stream_camera_ffmpeg(camera_url, frame_queue):
     """FFmpeg-based streaming function optimized for real-time feed."""
-    process = None
-    try:
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-rtsp_transport", "tcp",
-            "-i", camera_url,
-            "-an",  # No audio
-            "-vf", "fps=7,scale=640:480",  # Optimize frame rate & scale for better performance
-            "-f", "image2pipe",
-            "-pix_fmt", "bgr24",  
-            "-vcodec", "rawvideo",
-            "-"
-        ]
+    global active_streams
 
-        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+    if camera_url in active_streams:
+        process = active_streams[camera_url]
 
-        frame_size = 640 * 480 * 3  # Frame size for 640x480, 3 channels (BGR)
-        while True:
-            raw_frame = process.stdout.read(frame_size)
-            if len(raw_frame) != frame_size:
-                continue  # Skip if frame is incomplete
-            
-            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))  # Convert bytes to NumPy array
-            _, jpeg = cv2.imencode(".jpg", frame)  # Encode frame as JPEG
+    else:
+        try:
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-rtsp_transport", "tcp",
+                "-i", camera_url,
+                "-an",  # No audio
+                "-vf", "fps=7,scale=640:480",  # Optimize frame rate & scale for better performance
+                "-f", "image2pipe",
+                "-pix_fmt", "bgr24",  
+                "-vcodec", "rawvideo",
+                "-"
+            ]
 
-            frame_queue.put(jpeg.tobytes())
+            process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+            active_streams[camera_url] = process
 
-    except Exception as e:
-        logger.error(f"FFmpeg Stream Error: {e}")
-    
-    finally:
-        if process:
-            process.kill()
+            frame_size = 640 * 480 * 3  # Frame size for 640x480, 3 channels (BGR)
+            while True:
+                raw_frame = process.stdout.read(frame_size)
+                if len(raw_frame) != frame_size:
+                    continue  # Skip if frame is incomplete
+                
+                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))  # Convert bytes to NumPy array
+                _, jpeg = cv2.imencode(".jpg", frame)  # Encode frame as JPEG
+
+                frame_queue.put(jpeg.tobytes())
+
+        except Exception as e:
+            logger.error(f"FFmpeg Stream Error: {e}")
+        
+        finally:
+            if process:
+                process.kill()
 
 
 def generate_frames(camera_url):
     """Generator function to yield frames for smooth streaming."""
-    frame_queue = Queue(maxsize=10)  # Prevent memory overload
+    frame_queue = Queue(maxsize=100)  # Prevent memory overload
     process = Process(target=stream_camera_ffmpeg, args=(camera_url, frame_queue))
     process.start()
 

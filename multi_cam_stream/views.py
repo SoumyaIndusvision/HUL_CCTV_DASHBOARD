@@ -4,11 +4,12 @@ import logging
 import threading
 import numpy as np
 import subprocess
+import queue
 from collections import deque
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Manager
 from concurrent.futures import ThreadPoolExecutor
 from django.http import StreamingHttpResponse, JsonResponse
-from django.shortcuts import render
+from django.shortcuts import get_object_or_404
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from drf_yasg.utils import swagger_auto_schema
@@ -423,62 +424,74 @@ class CameraViewSet(viewsets.ViewSet):
             serializer.save()
             return Response({"message": "Camera created", "status": status.HTTP_201_CREATED})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-# Store active FFmpeg processes
-active_streams = {}
-
-def stream_camera_ffmpeg(camera_url, frame_queue):
-    """FFmpeg-based streaming function optimized for real-time feed."""
-    global active_streams
-
-    if camera_url in active_streams:
-        process = active_streams[camera_url]
-
-    else:
-        try:
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-rtsp_transport", "tcp",
-                "-i", camera_url,
-                "-an",  # No audio
-                "-vf", "fps=7,scale=640:480",  # Optimize frame rate & scale for better performance
-                "-f", "image2pipe",
-                "-pix_fmt", "bgr24",  
-                "-vcodec", "rawvideo",
-                "-"
-            ]
-
-            process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-            active_streams[camera_url] = process
-
-            frame_size = 640 * 480 * 3  # Frame size for 640x480, 3 channels (BGR)
-            while True:
-                raw_frame = process.stdout.read(frame_size)
-                if len(raw_frame) != frame_size:
-                    continue  # Skip if frame is incomplete
-                
-                frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))  # Convert bytes to NumPy array
-                _, jpeg = cv2.imencode(".jpg", frame)  # Encode frame as JPEG
-
-                frame_queue.put(jpeg.tobytes())
-
-        except Exception as e:
-            logger.error(f"FFmpeg Stream Error: {e}")
-        
-        finally:
-            if process:
-                process.kill()
+    
+# Store running FFmpeg processes & queues
+stream_manager = Manager()
+active_streams = stream_manager.dict()  # Shared dictionary for FFmpeg processes
+frame_queues = stream_manager.dict()  # Shared dictionary for frame queues
+MAX_CONCURRENT_STREAMS = 10  # Adjust based on system resources
 
 
-def generate_frames(camera_url):
-    """Generator function to yield frames for smooth streaming."""
-    frame_queue = Queue(maxsize=100)  # Prevent memory overload
-    process = Process(target=stream_camera_ffmpeg, args=(camera_url, frame_queue))
-    process.start()
+def stream_camera_ffmpeg(camera_id, camera_url):
+    """
+    FFmpeg streaming function optimized for real-time feed.
+    Ensures a single process per camera and reuses it when needed.
+    """
+    global active_streams, frame_queues
+
+    if camera_id in active_streams:
+        return  # Process already running
+
+    frame_queue = queue.Queue(maxsize=30)  # Prevent memory overload
+    frame_queues[camera_id] = frame_queue
 
     try:
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-rtsp_transport", "tcp",
+            "-i", camera_url,
+            "-an",  # No audio
+            "-vf", "fps=7,scale=640:480",  # Optimize frame rate & scale
+            "-f", "image2pipe",
+            "-pix_fmt", "bgr24",
+            "-vcodec", "rawvideo",
+            "-"
+        ]
+
+        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+        active_streams[camera_id] = process
+
+        frame_size = 640 * 480 * 3  # Frame size for 640x480, 3 channels (BGR)
+
         while True:
-            frame = frame_queue.get()
+            raw_frame = process.stdout.read(frame_size)
+            if len(raw_frame) != frame_size:
+                continue  # Skip incomplete frame
+
+            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))  # Convert bytes to NumPy array
+            _, jpeg = cv2.imencode(".jpg", frame)  # Encode frame as JPEG
+
+            if frame_queue.full():
+                frame_queue.get()  # Drop old frame if full
+            frame_queue.put(jpeg.tobytes())
+
+    except Exception as e:
+        logger.error(f"FFmpeg Stream Error: {e}")
+    finally:
+        process.kill()
+        del active_streams[camera_id]
+
+
+def generate_frames(camera_id):
+    """Generator function to yield frames for smooth streaming."""
+    if camera_id not in frame_queues:
+        return
+
+    frame_queue = frame_queues[camera_id]
+
+    while True:
+        try:
+            frame = frame_queue.get(timeout=5)  # Wait max 5s
             if frame is None:
                 break  # Stop if no frames
 
@@ -487,26 +500,22 @@ def generate_frames(camera_url):
                    b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
                    b'\r\n' + frame + b'\r\n')
 
-    except Exception as e:
-        logger.error(f"Frame Generator Error: {e}")
-    
-    finally:
-        process.terminate()
+        except queue.Empty:
+            break  # Stop if no frames available
 
 
 def video_feed(request, camera_id):
     """Django view to handle optimized video streaming."""
-    try:
-        camera = Camera.objects.get(id=camera_id)
-        camera_url = camera.get_rtsp_url()
+    camera = get_object_or_404(Camera, id=camera_id)
+    camera_url = camera.get_rtsp_url()
 
-        return StreamingHttpResponse(generate_frames(camera_url),
-                                     content_type='multipart/x-mixed-replace; boundary=frame')
-    except Camera.DoesNotExist:
-        return JsonResponse({"message": "Camera not found", "status": status.HTTP_404_NOT_FOUND})
+    if camera_id not in active_streams:
+        threading.Thread(target=stream_camera_ffmpeg, args=(camera_id, camera_url)).start()
+
+    return StreamingHttpResponse(generate_frames(camera_id),
+                                 content_type='multipart/x-mixed-replace; boundary=frame')
 
 
-    
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """
     ViewSet to stream multiple cameras for a specific section.
@@ -532,27 +541,160 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         }
     )
     def retrieve(self, request, pk=None):
-        try:
-            section = Section.objects.get(id=pk)
-        except Section.DoesNotExist:
-            return Response({"message": "Section not found.", "status": status.HTTP_404_NOT_FOUND})
-
+        section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
-        active_streams = {}
+
+        # Limit concurrent FFmpeg processes to avoid system overload
+        active_streams_count = len(active_streams)
+        if active_streams_count >= MAX_CONCURRENT_STREAMS:
+            return Response({"message": "Too many streams. Try again later.", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
+
+        active_stream_urls = {}
 
         def process_camera(camera):
-            """Checks camera status and adds to active streams if reachable."""
-            camera_url = f"/api/video_feed/{camera.id}/"
-            active_streams[camera.id] = camera_url
+            """Launch camera stream process if not running."""
+            if camera.id not in active_streams:
+                threading.Thread(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url())).start()
+            active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
 
-        # Use ThreadPoolExecutor for parallel processing
-        with ThreadPoolExecutor(max_workers=min(len(cameras), 30)) as executor:
+        # Use ThreadPoolExecutor to launch multiple cameras efficiently
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS) as executor:
             executor.map(process_camera, cameras)
 
-        if not active_streams:
+        if not active_stream_urls:
             return Response({"message": "No active cameras found.", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
 
-        return Response({"message": "All cameras feed path", "section_id": pk, "streams": active_streams, "status": status.HTTP_200_OK})
+        return Response({"message": "All cameras feed path", "section_id": pk, "streams": active_stream_urls, "status": status.HTTP_200_OK})
+
+# # Store active FFmpeg processes
+# active_streams = {}
+
+# def stream_camera_ffmpeg(camera_url, frame_queue):
+#     """FFmpeg-based streaming function optimized for real-time feed."""
+#     global active_streams
+
+#     if camera_url in active_streams:
+#         process = active_streams[camera_url]
+
+#     else:
+#         try:
+#             ffmpeg_cmd = [
+#                 "ffmpeg",
+#                 "-rtsp_transport", "tcp",
+#                 "-i", camera_url,
+#                 "-an",  # No audio
+#                 "-vf", "fps=7,scale=640:480",  # Optimize frame rate & scale for better performance
+#                 "-f", "image2pipe",
+#                 "-pix_fmt", "bgr24",  
+#                 "-vcodec", "rawvideo",
+#                 "-"
+#             ]
+
+#             process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+#             active_streams[camera_url] = process
+
+#             frame_size = 640 * 480 * 3  # Frame size for 640x480, 3 channels (BGR)
+#             while True:
+#                 raw_frame = process.stdout.read(frame_size)
+#                 if len(raw_frame) != frame_size:
+#                     continue  # Skip if frame is incomplete
+                
+#                 frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))  # Convert bytes to NumPy array
+#                 _, jpeg = cv2.imencode(".jpg", frame)  # Encode frame as JPEG
+
+#                 frame_queue.put(jpeg.tobytes())
+
+#         except Exception as e:
+#             logger.error(f"FFmpeg Stream Error: {e}")
+        
+#         finally:
+#             if process:
+#                 process.kill()
+
+
+# def generate_frames(camera_url):
+#     """Generator function to yield frames for smooth streaming."""
+#     frame_queue = Queue(maxsize=100)  # Prevent memory overload
+#     process = Process(target=stream_camera_ffmpeg, args=(camera_url, frame_queue))
+#     process.start()
+
+#     try:
+#         while True:
+#             frame = frame_queue.get()
+#             if frame is None:
+#                 break  # Stop if no frames
+
+#             yield (b'--frame\r\n'
+#                    b'Content-Type: image/jpeg\r\n'
+#                    b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
+#                    b'\r\n' + frame + b'\r\n')
+
+#     except Exception as e:
+#         logger.error(f"Frame Generator Error: {e}")
+    
+#     finally:
+#         process.terminate()
+
+
+# def video_feed(request, camera_id):
+#     """Django view to handle optimized video streaming."""
+#     try:
+#         camera = Camera.objects.get(id=camera_id)
+#         camera_url = camera.get_rtsp_url()
+
+#         return StreamingHttpResponse(generate_frames(camera_url),
+#                                      content_type='multipart/x-mixed-replace; boundary=frame')
+#     except Camera.DoesNotExist:
+#         return JsonResponse({"message": "Camera not found", "status": status.HTTP_404_NOT_FOUND})
+
+
+    
+# class MultiCameraStreamViewSet(viewsets.ViewSet):
+#     """
+#     ViewSet to stream multiple cameras for a specific section.
+#     """
+#     @swagger_auto_schema(
+#         operation_summary="Retrieve Active Camera Streams for a Section",
+#         operation_description="Fetches and returns active camera streams for the specified section.",
+#         responses={
+#             200: openapi.Response(
+#                 description="Returns a list of active camera streams.",
+#                 examples={
+#                     "application/json": {
+#                         "streams": {
+#                             "1": "/api/video_feed/1/",
+#                             "2": "/api/video_feed/2/"
+#                         }
+#                     }
+#                 }
+#             ),
+#             400: openapi.Response(description="Invalid section ID."),
+#             404: openapi.Response(description="Section not found."),
+#             503: openapi.Response(description="No active cameras found."),
+#         }
+#     )
+#     def retrieve(self, request, pk=None):
+#         try:
+#             section = Section.objects.get(id=pk)
+#         except Section.DoesNotExist:
+#             return Response({"message": "Section not found.", "status": status.HTTP_404_NOT_FOUND})
+
+#         cameras = Camera.objects.filter(section=section, is_active=True)
+#         active_streams = {}
+
+#         def process_camera(camera):
+#             """Checks camera status and adds to active streams if reachable."""
+#             camera_url = f"/api/video_feed/{camera.id}/"
+#             active_streams[camera.id] = camera_url
+
+#         # Use ThreadPoolExecutor for parallel processing
+#         with ThreadPoolExecutor(max_workers=min(len(cameras), 30)) as executor:
+#             executor.map(process_camera, cameras)
+
+#         if not active_streams:
+#             return Response({"message": "No active cameras found.", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
+
+#         return Response({"message": "All cameras feed path", "section_id": pk, "streams": active_streams, "status": status.HTTP_200_OK})
 
 
 

@@ -513,7 +513,7 @@ def video_feed(request, camera_id):
     camera = get_object_or_404(Camera, id=camera_id)
     
     if camera_id in unresponsive_cameras:
-        return JsonResponse({"message": "Camera is unresponsive", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
+        return Response({"message": "Camera is unresponsive", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
 
     with stream_lock:
         if camera_id not in active_streams:

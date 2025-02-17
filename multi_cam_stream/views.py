@@ -442,7 +442,7 @@ def stream_camera_ffmpeg(camera_id, camera_url):
     if camera_id in active_streams:
         return  # Process already running
 
-    frame_queue = Queue(maxsize=30)  # Prevent memory overload
+    frame_queue = queue.Queue(maxsize=30)  # Prevent memory overload
     frame_queues[camera_id] = frame_queue
 
     try:

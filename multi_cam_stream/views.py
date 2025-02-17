@@ -454,7 +454,7 @@ def stream_camera_ffmpeg(camera_id, camera_url):
             "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
         ]
         
-        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
 
         with stream_lock:
             active_streams[camera_id] = process

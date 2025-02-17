@@ -487,7 +487,7 @@ def stream_camera_ffmpeg(camera_id, camera_url):
     finally:
         with stream_lock:
             if camera_id in active_streams:
-                process.kill()
+                process.kill()  # Terminate the process immediately
                 del active_streams[camera_id]
                 del frame_queues[camera_id]
 

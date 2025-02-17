@@ -512,13 +512,15 @@ def video_feed(request, camera_id):
     """Django view for optimized video streaming."""
     camera = get_object_or_404(Camera, id=camera_id)
     
+    # If the camera is unresponsive, return API response with status
     if camera_id in unresponsive_cameras:
-        return Response({"message": "Camera is unresponsive", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
+        return JsonResponse({"message": "Camera is unresponsive", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
 
     with stream_lock:
         if camera_id not in active_streams:
             threading.Thread(target=stream_camera_ffmpeg, args=(camera_id, camera.get_rtsp_url()), daemon=True).start()
     
+    # Return StreamingHttpResponse for the video feed
     return StreamingHttpResponse(generate_frames(camera_id),
                                  content_type='multipart/x-mixed-replace; boundary=frame')
 
@@ -551,12 +553,14 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_stream_urls = {}
-        
+        unresponsive_camera_urls = {}
+
         def process_camera(camera):
             """Launch camera stream process if not running."""
             with stream_lock:
                 if camera.id in unresponsive_cameras:
-                    return {camera.id: "unresponsive"}
+                    unresponsive_camera_urls[camera.id] = "unresponsive"
+                    return None  # Skip unresponsive camera
                 if camera.id not in active_streams:
                     threading.Thread(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url()), daemon=True).start()
                 return {camera.id: f"/api/video_feed/{camera.id}/"}
@@ -565,12 +569,19 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
             futures = {executor.submit(process_camera, camera): camera.id for camera in cameras}
             for future in as_completed(futures):
                 result = future.result()
-                active_stream_urls.update(result)
-        
-        if not active_stream_urls:
+                if result:
+                    active_stream_urls.update(result)
+
+        # Prepare the response
+        if not active_stream_urls and not unresponsive_camera_urls:
             return Response({"message": "No active cameras found.", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
         
-        return Response({"message": "All camera feeds", "section_id": pk, "streams": active_stream_urls, "status": status.HTTP_200_OK})
+        response_data = {"message": "All camera feeds", "section_id": pk, "streams": active_stream_urls}
+
+        if unresponsive_camera_urls:
+            response_data["unresponsive_cameras"] = unresponsive_camera_urls
+
+        return Response(response_data, status=status.HTTP_200_OK)
 
 # # Store active FFmpeg processes
 # active_streams = {}

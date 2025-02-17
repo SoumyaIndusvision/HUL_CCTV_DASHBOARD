@@ -425,7 +425,6 @@ class CameraViewSet(viewsets.ViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 # Constants
-MAX_CONCURRENT_STREAMS = 15  # Increase the concurrent streams limit
 FRAME_TIMEOUT = 20  # Max time to wait for the first frame in seconds
 
 # Thread-safe storage for FFmpeg processes and frame queues
@@ -433,9 +432,6 @@ active_streams = {}
 frame_queues = {}
 unresponsive_cameras = set()
 stream_lock = threading.Lock()
-
-# Set the maximum number of concurrent camera streams
-thread_pool_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
 
 # Stream handling and FFmpeg process
 def stream_camera_ffmpeg(camera_id, camera_url):
@@ -533,7 +529,7 @@ def create_executor():
     """Creates a new thread pool executor if necessary."""
     global thread_pool_executor
     if thread_pool_executor._shutdown:
-        thread_pool_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
+        thread_pool_executor = ThreadPoolExecutor()
 
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """
@@ -599,7 +595,7 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         if unresponsive_camera_urls:
             response_data["unresponsive_cameras"] = unresponsive_camera_urls
 
-        return Response(response_data, status=status.HTTP_200_OK)    
+        return Response(response_data, status=status.HTTP_200_OK)
 
 
 

@@ -433,6 +433,16 @@ frame_queues = {}
 unresponsive_cameras = set()
 stream_lock = threading.Lock()
 
+# Initialize a ThreadPoolExecutor globally
+thread_pool_executor = ThreadPoolExecutor()
+
+# Ensure that the executor is not shutdown before submitting tasks.
+def create_executor():
+    """Creates a new thread pool executor if necessary."""
+    global thread_pool_executor
+    if thread_pool_executor._shutdown:
+        thread_pool_executor = ThreadPoolExecutor()
+
 # Stream handling and FFmpeg process
 def stream_camera_ffmpeg(camera_id, camera_url):
     """
@@ -523,13 +533,6 @@ def video_feed(request, camera_id):
     # Return StreamingHttpResponse for the video feed
     return StreamingHttpResponse(generate_frames(camera_id),
                                  content_type='multipart/x-mixed-replace; boundary=frame')
-
-# Ensure that the executor is not shutdown before submitting tasks.
-def create_executor():
-    """Creates a new thread pool executor if necessary."""
-    global thread_pool_executor
-    if thread_pool_executor._shutdown:
-        thread_pool_executor = ThreadPoolExecutor()
 
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """

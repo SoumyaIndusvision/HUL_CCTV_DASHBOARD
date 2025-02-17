@@ -427,39 +427,33 @@ class CameraViewSet(viewsets.ViewSet):
 # Thread-safe storage for FFmpeg processes and frame queues
 active_streams = {}
 frame_queues = {}
+unresponsive_cameras = set()
 stream_lock = threading.Lock()
 
-# Limit number of concurrent streams
+# Limits
 MAX_CONCURRENT_STREAMS = 15
 FRAME_TIMEOUT = 10  # Max time to wait for the first frame in seconds
-
 
 def stream_camera_ffmpeg(camera_id, camera_url):
     """
     Starts an FFmpeg process to capture frames from the camera.
-    If the camera is unresponsive, it will timeout.
+    If the camera is unresponsive, it is marked accordingly.
     """
-    global active_streams, frame_queues
+    global active_streams, frame_queues, unresponsive_cameras
 
     with stream_lock:
         if camera_id in active_streams:
             return  # Process already running
-
+        
         frame_queues[camera_id] = queue.Queue(maxsize=30)
 
     try:
         ffmpeg_cmd = [
-            "ffmpeg",
-            "-rtsp_transport", "tcp",
-            "-i", camera_url,
-            "-an",  # No audio
-            "-vf", "fps=7,scale=640:480",
-            "-f", "image2pipe",
-            "-pix_fmt", "bgr24",
-            "-vcodec", "rawvideo",
-            "-"
+            "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
+            "-an", "-vf", "fps=7,scale=640:480", "-f", "image2pipe",
+            "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
         ]
-
+        
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
 
         with stream_lock:
@@ -470,23 +464,23 @@ def stream_camera_ffmpeg(camera_id, camera_url):
 
         while True:
             raw_frame = process.stdout.read(frame_size)
-
+            
             if len(raw_frame) != frame_size:
-                # Check for timeout
                 if time.time() - start_time > FRAME_TIMEOUT:
-                    logger.error(f"Camera {camera_id} is unresponsive. Stopping stream.")
+                    logger.error(f"Camera {camera_id} unresponsive. Skipping stream.")
+                    unresponsive_cameras.add(camera_id)
                     break
                 continue
-
+            
             frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
             _, jpeg = cv2.imencode(".jpg", frame)
-
+            
             with stream_lock:
                 if frame_queues[camera_id].full():
-                    frame_queues[camera_id].get()  # Drop oldest frame
+                    frame_queues[camera_id].get()
                 frame_queues[camera_id].put(jpeg.tobytes())
-
-            start_time = time.time()  # Reset timeout since a frame arrived
+            
+            start_time = time.time()  # Reset timeout
 
     except Exception as e:
         logger.error(f"FFmpeg Stream Error for camera {camera_id}: {e}")
@@ -497,40 +491,34 @@ def stream_camera_ffmpeg(camera_id, camera_url):
                 del active_streams[camera_id]
                 del frame_queues[camera_id]
 
-
 def generate_frames(camera_id):
-    """Yields frames from the queue for smooth streaming, with timeout handling."""
+    """Yields frames from the queue for smooth streaming."""
     while True:
         with stream_lock:
-            if camera_id not in frame_queues:
+            if camera_id not in frame_queues or camera_id in unresponsive_cameras:
                 break
-
-            frame_queue = frame_queues[camera_id]
-
         try:
-            frame = frame_queue.get(timeout=FRAME_TIMEOUT)
+            frame = frame_queues[camera_id].get(timeout=FRAME_TIMEOUT)
             if frame is None:
                 break
-
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n'
                    b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
                    b'\r\n' + frame + b'\r\n')
-
         except queue.Empty:
-            logger.warning(f"Camera {camera_id} is not sending frames. Marking as unresponsive.")
             break
 
-
 def video_feed(request, camera_id):
-    """Django view to handle optimized video streaming."""
+    """Django view for optimized video streaming."""
     camera = get_object_or_404(Camera, id=camera_id)
-    camera_url = camera.get_rtsp_url()
+    
+    if camera_id in unresponsive_cameras:
+        return JsonResponse({"message": "Camera is unresponsive", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
 
     with stream_lock:
         if camera_id not in active_streams:
-            threading.Thread(target=stream_camera_ffmpeg, args=(camera_id, camera_url), daemon=True).start()
-
+            threading.Thread(target=stream_camera_ffmpeg, args=(camera_id, camera.get_rtsp_url()), daemon=True).start()
+    
     return StreamingHttpResponse(generate_frames(camera_id),
                                  content_type='multipart/x-mixed-replace; boundary=frame')
 
@@ -562,34 +550,27 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
     def retrieve(self, request, pk=None):
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
-
-        with stream_lock:
-            if len(active_streams) >= MAX_CONCURRENT_STREAMS:
-                return Response({"message": "Too many streams. Try again later.", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
-
         active_stream_urls = {}
-
+        
         def process_camera(camera):
             """Launch camera stream process if not running."""
             with stream_lock:
+                if camera.id in unresponsive_cameras:
+                    return {camera.id: "unresponsive"}
                 if camera.id not in active_streams:
                     threading.Thread(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url()), daemon=True).start()
-                active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
-
-        # Use ThreadPoolExecutor to manage multiple camera streams efficiently
+                return {camera.id: f"/api/video_feed/{camera.id}/"}
+        
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS) as executor:
             futures = {executor.submit(process_camera, camera): camera.id for camera in cameras}
-
             for future in as_completed(futures):
-                try:
-                    future.result()  # Catch exceptions
-                except Exception as e:
-                    logger.error(f"Error processing camera {futures[future]}: {e}")
-
+                result = future.result()
+                active_stream_urls.update(result)
+        
         if not active_stream_urls:
             return Response({"message": "No active cameras found.", "status": status.HTTP_503_SERVICE_UNAVAILABLE})
-
-        return Response({"message": "All cameras feed path", "section_id": pk, "streams": active_stream_urls, "status": status.HTTP_200_OK})
+        
+        return Response({"message": "All camera feeds", "section_id": pk, "streams": active_stream_urls, "status": status.HTTP_200_OK})
 
 # # Store active FFmpeg processes
 # active_streams = {}

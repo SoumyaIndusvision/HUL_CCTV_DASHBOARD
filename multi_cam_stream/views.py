@@ -553,13 +553,14 @@ def generate_frames(camera_id):
 
         with stream_lock:
             if frame_buffers[camera_id]:
-                frame = frame_buffers[camera_id][-1]
+                frame = frame_buffers[camera_id].pop()
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n'
                        b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
                        b'\r\n' + frame + b'\r\n')
             else:
                 break
+
 
 def video_feed(request, camera_id):
     """Django view for optimized video streaming."""
@@ -574,6 +575,7 @@ def video_feed(request, camera_id):
 
     return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
 
+
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """Handles multi-camera streaming for sections."""
 
@@ -583,8 +585,8 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         active_stream_urls = {}
 
         # Parallel execution of camera stream starts
-        futures = {camera.id: thread_pool_executor.submit(start_camera, camera) for camera in cameras}
-        
+        futures = {camera.id: thread_pool_executor.submit(self.start_camera, camera) for camera in cameras}
+
         for camera_id, future in futures.items():
             result = future.result()
             if result:
@@ -592,12 +594,12 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
 
         return Response({"message": "All camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)
 
-def start_camera(camera):
-    """Starts camera stream if not active."""
-    with stream_lock:
-        if camera.id not in active_streams:
-            thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
-    return {camera.id: f"/api/video_feed/{camera.id}/"}
+    def start_camera(self, camera):
+        """Starts camera stream if not active."""
+        with stream_lock:
+            if camera.id not in active_streams:
+                thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
+        return {camera.id: f"/api/video_feed/{camera.id}/"}
 
 
 

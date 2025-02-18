@@ -563,6 +563,36 @@ def video_feed(request, camera_id):
                                  content_type='multipart/x-mixed-replace; boundary=frame')
 
 
+class MultiCameraStreamViewSet(viewsets.ViewSet):
+    """
+    ViewSet to stream multiple cameras for a specific section.
+    """
+    def retrieve(self, request, pk=None):
+        section = get_object_or_404(Section, id=pk)
+        cameras = Camera.objects.filter(section=section, is_active=True)
+        active_stream_urls = {}
+
+        futures = [thread_pool_executor.submit(start_camera, camera) for camera in cameras]
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                active_stream_urls.update(result)
+
+        return Response({"message": "All camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)
+
+def start_camera(camera):
+    """Starts camera stream if not active."""
+    try:
+        with stream_lock:
+            if camera.id not in active_streams:
+                thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
+        return {camera.id: f"/api/video_feed/{camera.id}/"}
+    except Exception as e:
+        logger.error(f"Error starting camera {camera.id}: {e}")
+        unresponsive_cameras.add(camera.id)
+        return None
+
+
 # # Constants
 # MAX_CONCURRENT_STREAMS = 15  # Increase the concurrent streams limit
 # FRAME_TIMEOUT = 20  # Max time to wait for the first frame in seconds

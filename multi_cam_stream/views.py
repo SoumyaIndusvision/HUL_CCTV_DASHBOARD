@@ -433,9 +433,8 @@ FRAME_TIMEOUT = 20
 manager = mp.Manager()
 active_streams = manager.dict()  # {camera_id: process}
 frame_buffers = manager.dict()   # {camera_id: deque}
-unresponsive_cameras = manager.set()
+unresponsive_cameras = manager.list()  # Change from set() to list()
 frame_conditions = manager.dict()  # {camera_id: mp.Condition()}
-logger = logging.getLogger(__name__)
 
 def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers, frame_conditions, unresponsive_cameras):
     """Starts FFmpeg process for a camera and maintains frame queue."""
@@ -459,7 +458,8 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers, frame_conditions,
             if len(raw_frame) != frame_size:
                 if time.time() - start_time > FRAME_TIMEOUT:
                     logger.error(f"Camera {camera_id} unresponsive. Stream will not restart.")
-                    unresponsive_cameras.add(camera_id)
+                    if camera_id not in list(unresponsive_cameras):  # Convert to list for lookup
+                        unresponsive_cameras.append(camera_id)  # Use append instead of add
                     break
                 continue
 

@@ -427,16 +427,16 @@ class CameraViewSet(viewsets.ViewSet):
     
 # Constants
 MAX_CONCURRENT_STREAMS = 15
-FRAME_TIMEOUT = 20
+FRAME_TIMEOUT = 60  # Mark as unresponsive after 60 seconds
 
-# Global Shared State using multiprocessing.Manager
+# Global Shared State
 manager = mp.Manager()
-active_streams = {}  # {camera_id: process} (store locally in the main process)
+active_streams = {}  # {camera_id: process}
 frame_buffers = manager.dict()  # {camera_id: deque}
 
 def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
     """Starts FFmpeg process for a camera and maintains frame queue."""
-    logger.debug(f"Starting stream for camera {camera_id} at {camera_url}")
+    logger.info(f"Starting stream for camera {camera_id} at {camera_url}")
 
     frame_buffers[camera_id] = deque(maxlen=30)
     
@@ -447,39 +447,46 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
             "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
         ]
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+        active_streams[camera_id] = process  # Track process
         frame_size = 640 * 480 * 3
-        start_time = time.time()
+        last_frame_time = time.time()
 
         while True:
             raw_frame = process.stdout.read(frame_size)
+            
             if len(raw_frame) != frame_size:
-                if time.time() - start_time > FRAME_TIMEOUT:
-                    logger.error(f"Camera {camera_id} unresponsive. Stream stopping.")
-                    break
+                # Check if unresponsive
+                if time.time() - last_frame_time > FRAME_TIMEOUT:
+                    logger.warning(f"Camera {camera_id} unresponsive for {FRAME_TIMEOUT} seconds. Terminating process.")
+                    cleanup_camera_stream(camera_id)
+                    return  # Exit process
                 continue
 
+            # Process frame
             frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
             _, jpeg = cv2.imencode(".jpg", frame)
             frame_buffers[camera_id].append(jpeg.tobytes())
 
-            start_time = time.time()
+            last_frame_time = time.time()  # Reset timeout on successful frame
 
     except Exception as e:
         logger.error(f"FFmpeg error for camera {camera_id}: {e}")
-    finally:
         cleanup_camera_stream(camera_id)
 
 def cleanup_camera_stream(camera_id):
-    """Cleans up FFmpeg process and frame buffer when a stream stops."""
+    """Cleans up process and removes camera if unresponsive."""
     if camera_id in active_streams:
-        active_streams[camera_id].kill()
+        process = active_streams[camera_id]
+        process.kill()
         del active_streams[camera_id]
+    
     if camera_id in frame_buffers:
         del frame_buffers[camera_id]
-    logger.debug(f"Cleaned up stream resources for camera {camera_id}")
+    
+    logger.info(f"Camera {camera_id} has been removed due to unresponsiveness.")
 
 def generate_frames(camera_id):
-    """Yields latest frames for efficient HTTP streaming."""
+    """Yields latest frames for HTTP streaming."""
     while True:
         if camera_id in frame_buffers and frame_buffers[camera_id]:
             frame = frame_buffers[camera_id][-1]
@@ -488,7 +495,7 @@ def generate_frames(camera_id):
                    b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
                    b'\r\n' + frame + b'\r\n')
         else:
-            break
+            time.sleep(0.5)  # Prevent excessive looping if no frames are available
 
 def initialize_all_camera_streams():
     """Starts multiprocessing for all active cameras on server startup."""
@@ -503,13 +510,13 @@ def initialize_all_camera_streams():
     logger.info("All active camera streams initialized.")
 
 def video_feed(request, camera_id):
-    """Django view for optimized video streaming."""
+    """Django view for video streaming."""
     camera = get_object_or_404(Camera, id=camera_id)
 
     if camera_id not in active_streams:
         process = mp.Process(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url(), frame_buffers))
         process.start()
-        active_streams[camera.id] = process
+        active_streams[camera_id] = process
 
     return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
 

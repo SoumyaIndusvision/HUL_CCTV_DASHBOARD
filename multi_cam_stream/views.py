@@ -2,6 +2,7 @@ import cv2
 import time
 import logging
 import threading
+import multiprocessing as mp
 import numpy as np
 import subprocess
 import queue
@@ -424,34 +425,23 @@ class CameraViewSet(viewsets.ViewSet):
             return Response({"message": "Camera created", "status": status.HTTP_201_CREATED})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-
 # Constants
 MAX_CONCURRENT_STREAMS = 15
 FRAME_TIMEOUT = 20
 
-# Global State
-active_streams = {}  # {camera_id: process}
-frame_buffers = {}   # {camera_id: deque}
-unresponsive_cameras = set()
-stream_lock = threading.Lock()
-thread_pool_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
-frame_conditions = {}  # {camera_id: threading.Condition()}
-
+# Global State using multiprocessing.Manager
+manager = mp.Manager()
+active_streams = manager.dict()  # {camera_id: process}
+frame_buffers = manager.dict()   # {camera_id: deque}
+unresponsive_cameras = manager.set()
+frame_conditions = manager.dict()  # {camera_id: mp.Condition()}
 logger = logging.getLogger(__name__)
 
-def stream_camera_ffmpeg(camera_id, camera_url):
+def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers, frame_conditions, unresponsive_cameras):
     """Starts FFmpeg process for a camera and maintains frame queue."""
-    global active_streams, frame_buffers, unresponsive_cameras
-
     logger.debug(f"Starting stream for camera {camera_id} at {camera_url}")
-
-    with stream_lock:
-        if camera_id in active_streams:
-            logger.debug(f"Camera {camera_id} already streaming.")
-            return  
-
-        frame_buffers[camera_id] = deque(maxlen=30)
-        frame_conditions[camera_id] = threading.Condition()
+    frame_buffers[camera_id] = deque(maxlen=30)
+    frame_conditions[camera_id] = mp.Condition()
 
     try:
         ffmpeg_cmd = [
@@ -459,12 +449,8 @@ def stream_camera_ffmpeg(camera_id, camera_url):
             "-an", "-vf", "fps=7,scale=640:480", "-f", "image2pipe",
             "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
         ]
-        
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-
-        with stream_lock:
-            active_streams[camera_id] = process
-
+        active_streams[camera_id] = process
         frame_size = 640 * 480 * 3
         start_time = time.time()
 
@@ -476,12 +462,10 @@ def stream_camera_ffmpeg(camera_id, camera_url):
                     unresponsive_cameras.add(camera_id)
                     break
                 continue
-            
+
             frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
             _, jpeg = cv2.imencode(".jpg", frame)
-
-            with stream_lock:
-                frame_buffers[camera_id].append(jpeg.tobytes())
+            frame_buffers[camera_id].append(jpeg.tobytes())
 
             with frame_conditions[camera_id]:
                 frame_conditions[camera_id].notify_all()
@@ -493,100 +477,239 @@ def stream_camera_ffmpeg(camera_id, camera_url):
     finally:
         cleanup_camera_stream(camera_id)
 
-
 def cleanup_camera_stream(camera_id):
     """Cleans up FFmpeg process and frame buffer when a stream stops."""
-    with stream_lock:
-        # Kill the FFmpeg process if it's active and remove it from active_streams
-        if camera_id in active_streams:
-            active_streams[camera_id].kill()
-            del active_streams[camera_id]
-        
-        # Remove the frame buffer and condition for the camera
-        if camera_id in frame_buffers:
-            del frame_buffers[camera_id]
-        
-        if camera_id in frame_conditions:
-            del frame_conditions[camera_id]
-
-        logger.debug(f"Cleaned up stream resources for camera {camera_id}")
-
+    if camera_id in active_streams:
+        active_streams[camera_id].kill()
+        del active_streams[camera_id]
+    if camera_id in frame_buffers:
+        del frame_buffers[camera_id]
+    if camera_id in frame_conditions:
+        del frame_conditions[camera_id]
+    logger.debug(f"Cleaned up stream resources for camera {camera_id}")
 
 def generate_frames(camera_id):
     """Yields latest frames for efficient HTTP streaming."""
     while True:
-        with stream_lock:
-            if camera_id not in frame_buffers or camera_id in unresponsive_cameras:
-                break
-        
+        if camera_id in unresponsive_cameras:
+            break
         with frame_conditions[camera_id]:
             frame_conditions[camera_id].wait(timeout=FRAME_TIMEOUT)
-
-        with stream_lock:
-            if frame_buffers[camera_id]:
-                frame = frame_buffers[camera_id][-1]
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n'
-                       b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
-                       b'\r\n' + frame + b'\r\n')
-            else:
-                break
-
+        if camera_id in frame_buffers and frame_buffers[camera_id]:
+            frame = frame_buffers[camera_id][-1]
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n'
+                   b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
+                   b'\r\n' + frame + b'\r\n')
+        else:
+            break
 
 def initialize_all_camera_streams():
-    """Sequentially starts streaming for all cameras section by section on server startup."""
+    """Starts multiprocessing for all cameras on server startup."""
     logger.info("Initializing all camera streams on server startup...")
-
-    sections = Section.objects.all().order_by("id")  # Fetch sections in order
-    for section in sections:
-        cameras = Camera.objects.filter(section=section, is_active=True).order_by("id")
-        
-        for camera in cameras:
-            with stream_lock:
-                if camera.id not in active_streams:
-                    logger.info(f"Starting camera {camera.id} in section {section.id}")
-                    thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
-
-        # Introduce a small delay to ensure sequential processing
-        time.sleep(1)  
-
+    processes = []
+    for section in Section.objects.all().order_by("id"):
+        for camera in Camera.objects.filter(section=section, is_active=True).order_by("id"):
+            if camera.id not in active_streams:
+                process = mp.Process(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url(), frame_buffers, frame_conditions, unresponsive_cameras))
+                process.start()
+                active_streams[camera.id] = process
+                processes.append(process)
+    for p in processes:
+        p.join(timeout=1)  # Ensures non-blocking startup
     logger.info("All camera streams initialized.")
-
 
 def video_feed(request, camera_id):
     """Django view for optimized video streaming."""
     camera = get_object_or_404(Camera, id=camera_id)
-
     if camera_id in unresponsive_cameras:
         return JsonResponse({"message": "Camera is unresponsive"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-
-    with stream_lock:
-        if camera_id not in active_streams:
-            thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
-
+    if camera_id not in active_streams:
+        process = mp.Process(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url(), frame_buffers, frame_conditions, unresponsive_cameras))
+        process.start()
+        active_streams[camera.id] = process
     return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
-
 
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """Handles multi-camera streaming for sections."""
-
     def retrieve(self, request, pk=None):
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_stream_urls = {}
-
-        with stream_lock:
-            for camera in cameras:
-                if camera.id not in active_streams:
-                    thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
-                active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
-
+        for camera in cameras:
+            if camera.id not in active_streams:
+                process = mp.Process(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url(), frame_buffers, frame_conditions, unresponsive_cameras))
+                process.start()
+                active_streams[camera.id] = process
+            active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
         return JsonResponse({"message": "All camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)
 
-
 # Run the initialization function on startup
-startup_thread = threading.Thread(target=initialize_all_camera_streams, daemon=True)
-startup_thread.start()
+startup_process = mp.Process(target=initialize_all_camera_streams)
+startup_process.start()
+
+# # Constants
+# MAX_CONCURRENT_STREAMS = 15
+# FRAME_TIMEOUT = 20
+
+# # Global State
+# active_streams = {}  # {camera_id: process}
+# frame_buffers = {}   # {camera_id: deque}
+# unresponsive_cameras = set()
+# stream_lock = threading.Lock()
+# thread_pool_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_STREAMS)
+# frame_conditions = {}  # {camera_id: threading.Condition()}
+
+# logger = logging.getLogger(__name__)
+
+# def stream_camera_ffmpeg(camera_id, camera_url):
+#     """Starts FFmpeg process for a camera and maintains frame queue."""
+#     global active_streams, frame_buffers, unresponsive_cameras
+
+#     logger.debug(f"Starting stream for camera {camera_id} at {camera_url}")
+
+#     with stream_lock:
+#         if camera_id in active_streams:
+#             logger.debug(f"Camera {camera_id} already streaming.")
+#             return  
+
+#         frame_buffers[camera_id] = deque(maxlen=30)
+#         frame_conditions[camera_id] = threading.Condition()
+
+#     try:
+#         ffmpeg_cmd = [
+#             "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
+#             "-an", "-vf", "fps=7,scale=640:480", "-f", "image2pipe",
+#             "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+#         ]
+        
+#         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+
+#         with stream_lock:
+#             active_streams[camera_id] = process
+
+#         frame_size = 640 * 480 * 3
+#         start_time = time.time()
+
+#         while True:
+#             raw_frame = process.stdout.read(frame_size)
+#             if len(raw_frame) != frame_size:
+#                 if time.time() - start_time > FRAME_TIMEOUT:
+#                     logger.error(f"Camera {camera_id} unresponsive. Stream will not restart.")
+#                     unresponsive_cameras.add(camera_id)
+#                     break
+#                 continue
+            
+#             frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
+#             _, jpeg = cv2.imencode(".jpg", frame)
+
+#             with stream_lock:
+#                 frame_buffers[camera_id].append(jpeg.tobytes())
+
+#             with frame_conditions[camera_id]:
+#                 frame_conditions[camera_id].notify_all()
+
+#             start_time = time.time()
+
+#     except Exception as e:
+#         logger.error(f"FFmpeg error for camera {camera_id}: {e}")
+#     finally:
+#         cleanup_camera_stream(camera_id)
+
+
+# def cleanup_camera_stream(camera_id):
+#     """Cleans up FFmpeg process and frame buffer when a stream stops."""
+#     with stream_lock:
+#         # Kill the FFmpeg process if it's active and remove it from active_streams
+#         if camera_id in active_streams:
+#             active_streams[camera_id].kill()
+#             del active_streams[camera_id]
+        
+#         # Remove the frame buffer and condition for the camera
+#         if camera_id in frame_buffers:
+#             del frame_buffers[camera_id]
+        
+#         if camera_id in frame_conditions:
+#             del frame_conditions[camera_id]
+
+#         logger.debug(f"Cleaned up stream resources for camera {camera_id}")
+
+
+# def generate_frames(camera_id):
+#     """Yields latest frames for efficient HTTP streaming."""
+#     while True:
+#         with stream_lock:
+#             if camera_id not in frame_buffers or camera_id in unresponsive_cameras:
+#                 break
+        
+#         with frame_conditions[camera_id]:
+#             frame_conditions[camera_id].wait(timeout=FRAME_TIMEOUT)
+
+#         with stream_lock:
+#             if frame_buffers[camera_id]:
+#                 frame = frame_buffers[camera_id][-1]
+#                 yield (b'--frame\r\n'
+#                        b'Content-Type: image/jpeg\r\n'
+#                        b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
+#                        b'\r\n' + frame + b'\r\n')
+#             else:
+#                 break
+
+
+# def initialize_all_camera_streams():
+#     """Sequentially starts streaming for all cameras section by section on server startup."""
+#     logger.info("Initializing all camera streams on server startup...")
+
+#     sections = Section.objects.all().order_by("id")  # Fetch sections in order
+#     for section in sections:
+#         cameras = Camera.objects.filter(section=section, is_active=True).order_by("id")
+        
+#         for camera in cameras:
+#             with stream_lock:
+#                 if camera.id not in active_streams:
+#                     logger.info(f"Starting camera {camera.id} in section {section.id}")
+#                     thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
+
+#         # Introduce a small delay to ensure sequential processing
+#         time.sleep(1)  
+
+#     logger.info("All camera streams initialized.")
+
+
+# def video_feed(request, camera_id):
+#     """Django view for optimized video streaming."""
+#     camera = get_object_or_404(Camera, id=camera_id)
+
+#     if camera_id in unresponsive_cameras:
+#         return JsonResponse({"message": "Camera is unresponsive"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+#     with stream_lock:
+#         if camera_id not in active_streams:
+#             thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
+
+#     return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
+
+
+# class MultiCameraStreamViewSet(viewsets.ViewSet):
+#     """Handles multi-camera streaming for sections."""
+
+#     def retrieve(self, request, pk=None):
+#         section = get_object_or_404(Section, id=pk)
+#         cameras = Camera.objects.filter(section=section, is_active=True)
+#         active_stream_urls = {}
+
+#         with stream_lock:
+#             for camera in cameras:
+#                 if camera.id not in active_streams:
+#                     thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
+#                 active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
+
+#         return JsonResponse({"message": "All camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)
+
+
+# # Run the initialization function on startup
+# startup_thread = threading.Thread(target=initialize_all_camera_streams, daemon=True)
+# startup_thread.start()
 
 
 

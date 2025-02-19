@@ -134,35 +134,37 @@ class SectionViewSet(viewsets.ViewSet):
     A ViewSet for managing Sections within a Serac.
     """
     @swagger_auto_schema(
-        operation_summary="List all sections for a Serac or return an error if `serac_id` is missing",
+        operation_summary="List all sections for a Serac, including associated camera IDs",
         operation_description=(
-            "Fetches all sections for the specified Serac ID. If `serac_id` is not provided, "
-            "it returns a `400 Bad Request` error indicating that the `serac_id` is required."
+            "Fetches all sections for the specified Serac ID along with their associated camera IDs. "
+            "If `serac_id` is not provided, it returns a `400 Bad Request` error."
         ),
         manual_parameters=[
             openapi.Parameter(
-                name="serac_id", 
-                in_=openapi.IN_QUERY, 
-                type=openapi.TYPE_INTEGER, 
+                name="serac_id",
+                in_=openapi.IN_QUERY,
+                type=openapi.TYPE_INTEGER,
                 description="ID of the Serac to retrieve sections for",
                 required=True
             )
         ],
         responses={
             200: openapi.Response(
-                description="A list of sections",
+                description="A list of sections with associated camera IDs",
                 examples={
                     "application/json": {
                         "results": [
                             {
                                 "id": 1,
                                 "name": "Section 1",
-                                "serac_id": 1
+                                "serac_id": 1,
+                                "camera_ids": [1, 2, 3]
                             },
                             {
                                 "id": 2,
                                 "name": "Section 2",
-                                "serac_id": 1
+                                "serac_id": 1,
+                                "camera_ids": [4, 5]
                             }
                         ],
                         "status": "200 OK"
@@ -190,12 +192,6 @@ class SectionViewSet(viewsets.ViewSet):
                 {"message": "serac_id is required", "status": status.HTTP_400_BAD_REQUEST}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
-        # if serac_id:
-        #     sections = Section.objects.filter(serac_id=serac_id)
-        # else:
-        #     sections = Section.objects.all()
-        # serializer = SectionSerializer(sections, many=True)
-        # return Response({"results": serializer.data, "status": status.HTTP_200_OK})
 
         try:
             serac = Seracs.objects.get(id=serac_id)
@@ -205,10 +201,19 @@ class SectionViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        sections = Section.objects.filter(serac_id=serac_id)
-        serializer = SectionSerializer(sections, many=True)
-        
-        return Response({"results": serializer.data, "status": status.HTTP_200_OK})
+        sections = Section.objects.filter(serac_id=serac_id).prefetch_related('cameras')
+
+        results = []
+        for section in sections:
+            camera_ids = list(section.cameras.values_list('id', flat=True))  # Fetch camera IDs
+            results.append({
+                "id": section.id,
+                "name": section.name,
+                "serac": section.serac_id,
+                "camera_ids": camera_ids  # Add camera_ids to response
+            })
+
+        return Response({"results": results, "status": status.HTTP_200_OK})
 
     @swagger_auto_schema(
         operation_summary="Retrieve a specific Section",
@@ -530,7 +535,26 @@ def video_feed(request, camera_id):
 
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """Handles multi-camera streaming for sections."""
-
+    @swagger_auto_schema(
+        operation_summary="Retrieve Active Camera Streams for a Section",
+        operation_description="Fetches and returns active camera streams for the specified section.",
+        responses={ 
+            200: openapi.Response(
+                description="Returns a list of active camera streams for a specified.",
+                examples={ 
+                    "application/json": { 
+                        "streams": { 
+                            "1": "/api/video_feed/1/", 
+                            "2": "/api/video_feed/2/" 
+                        } 
+                    }
+                }
+            ),
+            400: openapi.Response(description="Invalid section ID."),
+            404: openapi.Response(description="Section not found."),
+            503: openapi.Response(description="No active cameras found."),
+        }
+    )
     def retrieve(self, request, pk=None):
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)

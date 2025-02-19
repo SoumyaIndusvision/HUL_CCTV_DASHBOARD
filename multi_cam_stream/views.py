@@ -438,12 +438,12 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
     """Starts FFmpeg process for a camera and maintains frame queue."""
     logger.info(f"Starting stream for camera {camera_id} at {camera_url}")
 
-    frame_buffers[camera_id] = deque(maxlen=30)
+    frame_buffers[camera_id] = deque(maxlen=60)
     
     try:
         ffmpeg_cmd = [
             "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
-            "-an", "-vf", "fps=7,scale=640:480", "-f", "image2pipe",
+            "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
             "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
         ]
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
@@ -464,13 +464,16 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
 
             # Process frame
             frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
-            _, jpeg = cv2.imencode(".jpg", frame)
+            _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             frame_buffers[camera_id].append(jpeg.tobytes())
 
             last_frame_time = time.time()  # Reset timeout on successful frame
 
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg subprocess error for camera {camera_id}: {e}")
     except Exception as e:
-        logger.error(f"FFmpeg error for camera {camera_id}: {e}")
+        logger.error(f"Unexpected error for camera {camera_id}: {e}")
+    finally:
         cleanup_camera_stream(camera_id)
 
 def cleanup_camera_stream(camera_id):
@@ -539,6 +542,8 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
 # Run the initialization function on startup
 startup_process = mp.Process(target=initialize_all_camera_streams)
 startup_process.start()
+
+#############################################################################################################
 
 # # Constants
 # MAX_CONCURRENT_STREAMS = 15
@@ -663,6 +668,9 @@ startup_process.start()
 # startup_process = mp.Process(target=initialize_all_camera_streams)
 # startup_process.start()
 
+
+##########################################################################################################################################################
+
 # # Constants
 # MAX_CONCURRENT_STREAMS = 15
 # FRAME_TIMEOUT = 20
@@ -826,7 +834,7 @@ startup_process.start()
 # startup_thread = threading.Thread(target=initialize_all_camera_streams, daemon=True)
 # startup_thread.start()
 
-
+#####################################################################################################################################################33
 
 # # Constants
 # MAX_CONCURRENT_STREAMS = 15
@@ -1020,6 +1028,8 @@ startup_process.start()
 # # Run the initialization function on startup
 # startup_thread = threading.Thread(target=initialize_all_camera_streams, daemon=True)
 # startup_thread.start()
+
+######################################################################################################################################################
 
 # # Constants
 # MAX_CONCURRENT_STREAMS = 15
@@ -1186,6 +1196,9 @@ startup_process.start()
 #                 active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
 
 #         return Response({"message": "All camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)
+
+########################################################################################################################################################
+
 
 # # Constants
 # MAX_CONCURRENT_STREAMS = 15
@@ -1363,7 +1376,7 @@ startup_process.start()
 #                 thread_pool_executor.submit(stream_camera_ffmpeg, camera.id, camera.get_rtsp_url())
 #         return {camera.id: f"/api/video_feed/{camera.id}/"}
 
-
+#########################################################################################################################################################
 
 # # Constants
 # MAX_CONCURRENT_STREAMS = 15  # Increase the concurrent streams limit
@@ -1563,7 +1576,7 @@ startup_process.start()
 #         logger.debug(f"Returning active camera streams for section {pk}")
 #         return Response(response_data, status=status.HTTP_200_OK)
 
-
+######################################################################################################################################################
 
 # # Store active FFmpeg processes
 # active_streams = {}
@@ -1695,7 +1708,7 @@ startup_process.start()
 
 #         return Response({"message": "All cameras feed path", "section_id": pk, "streams": active_streams, "status": status.HTTP_200_OK})
 
-
+#########################################################################################################################################################
 
 # import cv2
 # import time
@@ -2223,3 +2236,4 @@ startup_process.start()
 
 #         return Response({"message": "All cameras feed path", "section_id": pk, "streams": active_streams, "status": status.HTTP_200_OK})
 
+############################################################################################################################################################

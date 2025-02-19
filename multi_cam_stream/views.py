@@ -513,12 +513,15 @@ def generate_frames(camera_id):
 def initialize_all_camera_streams():
     """Starts multiprocessing for all active cameras on server startup."""
     logger.info("Initializing all active camera streams...")
-    for section in Section.objects.all().order_by("id"):
-        for camera in Camera.objects.filter(section=section, is_active=True).order_by("id"):
-            if camera.id not in active_streams:
-                process = mp.Process(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url(), frame_buffers))
-                process.start()
-                active_streams[camera.id] = process.pid  # Store process ID
+
+    # Fetch all active cameras at once
+    active_cameras = Camera.objects.filter(is_active=True).order_by("id")
+
+    for camera in active_cameras:
+        if camera.id not in active_streams:
+            process = mp.Process(target=stream_camera_ffmpeg, args=(camera.id, camera.get_rtsp_url(), frame_buffers))
+            process.start()
+            active_streams[camera.id] = process.pid  # Store process ID
 
     logger.info("All camera streams initialized.")
 

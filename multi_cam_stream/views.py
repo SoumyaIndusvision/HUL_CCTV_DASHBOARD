@@ -474,7 +474,7 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
     logger.info(f"Starting stream for camera {camera_id} at {camera_url}")
 
     frame_buffers[camera_id] = manager.list()  # Shared memory list
-    
+
     try:
         ffmpeg_cmd = [
             "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
@@ -491,8 +491,8 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
 
             if len(raw_frame) != frame_size:
                 if time.time() - last_frame_time > FRAME_TIMEOUT:
-                    logger.warning(f"Camera {camera_id} unresponsive for {FRAME_TIMEOUT} seconds. Terminating process.")
-                    cleanup_camera_stream(camera_id)
+                    logger.warning(f"Camera {camera_id} unresponsive for {FRAME_TIMEOUT} seconds. Restarting...")
+                    restart_camera_stream(camera_id)
                     return  
                 continue
 
@@ -508,8 +508,12 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
 
     except subprocess.CalledProcessError as e:
         logger.error(f"FFmpeg subprocess error for camera {camera_id}: {e}")
+        restart_camera_stream(camera_id)
+
     except Exception as e:
         logger.error(f"Unexpected error for camera {camera_id}: {e}")
+        restart_camera_stream(camera_id)
+
     finally:
         cleanup_camera_stream(camera_id)
 
@@ -522,11 +526,35 @@ def cleanup_camera_stream(camera_id):
         pid = active_streams[camera_id]
         subprocess.call(["kill", "-9", str(pid)])  # Kill process by PID
         del active_streams[camera_id]
-    
+
     if camera_id in frame_buffers:
         del frame_buffers[camera_id]
+
+    logger.info(f"Camera {camera_id} process cleaned up.")
+
+# -----------------------------------------
+# FUNCTION: Restart Camera Process
+# -----------------------------------------
+def restart_camera_stream(camera_id):
+    """Restarts a camera stream after failure."""
+    logger.info(f"Restarting camera {camera_id}...")
+    time.sleep(2)  # Short delay before restarting
+    camera = Camera.objects.filter(id=camera_id).first()
     
-    logger.info(f"Camera {camera_id} has been removed due to unresponsiveness.")
+    if camera:
+        start_camera_process(camera.id, camera.get_rtsp_url())
+        logger.info(f"Camera {camera_id} restarted successfully.")
+    else:
+        logger.error(f"Camera {camera_id} not found in database. Cannot restart.")
+
+# -----------------------------------------
+# FUNCTION: Blank Frame For Cameras
+# -----------------------------------------
+def get_blank_frame():
+    """Returns a blank black frame encoded as JPEG."""
+    blank_image = np.zeros((480, 640, 3), dtype=np.uint8)  # Black image (480x640)
+    _, jpeg = cv2.imencode(".jpg", blank_image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return jpeg.tobytes()
 
 # -----------------------------------------
 # FUNCTION: Generate Video Feed Frames
@@ -535,13 +563,20 @@ def generate_frames(camera_id):
     """Yields latest frames for HTTP streaming."""
     while True:
         if camera_id in frame_buffers and frame_buffers[camera_id]:
-            frame = frame_buffers[camera_id][-1]  # Get the latest frame
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n'
-                   b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
-                   b'\r\n' + frame + b'\r\n')
+            try:
+                frame = frame_buffers[camera_id][-1]  # Get the latest frame
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
+                       b'\r\n' + frame + b'\r\n')
+            except IndexError:
+                logger.warning(f"No frames available for Camera {camera_id}, sending blank frame.")
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       b'\r\n' + get_blank_frame() + b'\r\n')  # Send a blank frame
         else:
-            time.sleep(0.5)  
+            logger.warning(f"Camera {camera_id} frame buffer is empty.")
+            time.sleep(0.5)
 
 # -----------------------------------------
 # DJANGO VIEW: Serve Video Feed

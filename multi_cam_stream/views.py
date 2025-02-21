@@ -445,17 +445,17 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------
 # ASYNC FUNCTION: Initialize Cameras in Sequence
 # -----------------------------------------
-# async def async_initialize_all_camera_streams():
-#     """Asynchronously fetches and starts camera streams in sequence."""
-#     logger.info("Asynchronously initializing all camera streams...")
+async def async_initialize_all_camera_streams():
+    """Asynchronously fetches and starts camera streams in sequence."""
+    logger.info("Asynchronously initializing all camera streams...")
 
-#     active_cameras = await asyncio.to_thread(lambda: list(Camera.objects.filter(is_active=True).order_by("id")))
+    active_cameras = await asyncio.to_thread(lambda: list(Camera.objects.filter(is_active=True).order_by("id")))
 
-#     for camera in active_cameras:
-#         if camera.id not in active_streams:
-#             await asyncio.to_thread(start_camera_process, camera.id, camera.get_rtsp_url())
+    for camera in active_cameras:
+        if camera.id not in active_streams:
+            await asyncio.to_thread(start_camera_process, camera.id, camera.get_rtsp_url())
 
-#     logger.info("All camera streams initialized asynchronously.")
+    logger.info("All camera streams initialized asynchronously.")
 
 # -----------------------------------------
 # MULTIPROCESS FUNCTION: Start Camera Stream
@@ -629,7 +629,7 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
 # -----------------------------------------
 # STARTUP: Run Async Initialization
 # -----------------------------------------
-# startup_task = asyncio.run(async_initialize_all_camera_streams())
+startup_task = asyncio.run(async_initialize_all_camera_streams())
 
 
 ############################################################################################################################################################

@@ -450,28 +450,46 @@ def video_feed(request, camera_id):
     """Django view for video streaming."""
     camera = get_object_or_404(Camera, id=camera_id)
 
+    # Ensure only cameras from the active section are running
+    current_section = cache.get("active_section")
+    if current_section != camera.section.id:
+        return JsonResponse({"error": "Camera is not part of the active section"}, status=403)
+
     # Start the Celery task if not already running
     if not cache.get(f"camera_active:{camera_id}"):
-        stream_camera_ffmpeg.delay(camera.id, camera.get_rtsp_url())
-        cache.set(f"camera_active:{camera_id}", True, timeout=60)  # Prevent duplicate tasks
+        stream_camera_ffmpeg.delay(camera.id, camera.get_rtsp_url(), camera.section.id)
+        cache.set(f"camera_active:{camera_id}", True, timeout=60)
 
     return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
 
+
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """API View for multi-camera streaming."""
-    
+
     def retrieve(self, request, pk=None):
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_stream_urls = {}
 
+        # Check currently active section
+        previous_section = cache.get("active_section")
+
+        # If the section has changed, terminate all previous section cameras
+        if previous_section and previous_section != pk:
+            previous_cameras = Camera.objects.filter(section_id=previous_section, is_active=True)
+            for camera in previous_cameras:
+                cache.delete(f"camera_active:{camera.id}")  # Remove active flag
+            cache.set("active_section", pk, timeout=60)
+
+        # Start streams for the current section
         for camera in cameras:
             active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
             if not cache.get(f"camera_active:{camera.id}"):
-                stream_camera_ffmpeg.delay(camera.id, camera.get_rtsp_url())
+                stream_camera_ffmpeg.delay(camera.id, camera.get_rtsp_url(), pk)
                 cache.set(f"camera_active:{camera.id}", True, timeout=60)
 
         return JsonResponse({"message": "Camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)
+
 
 ###################################################################################################################################3
 

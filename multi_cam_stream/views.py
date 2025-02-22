@@ -561,7 +561,7 @@ def generate_frames(camera_id):
     while True:
         if camera_id in frame_buffers and frame_buffers[camera_id]:
             logger.warning(f"Camera {camera_id} buffer empty. Waiting...")
-            time.sleep(1)   # Avoid high CPU usage
+            # time.sleep(1)   # Avoid high CPU usage
             continue
         
         try:
@@ -574,7 +574,7 @@ def generate_frames(camera_id):
             yield get_blank_frame()
         except KeyError:
             logger.error(f"Frame buffer missing for camera {camera_id}. Retrying...")
-            time.sleep(0.5)
+            # time.sleep(0.5)
 
 # -----------------------------------------
 # FUNCTION: Blank Frame

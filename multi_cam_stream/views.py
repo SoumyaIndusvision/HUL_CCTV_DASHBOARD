@@ -584,17 +584,17 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------
 # ASYNC FUNCTION: Initialize All Camera Streams
 # -----------------------------------------
-async def async_initialize_all_camera_streams():
-    """Asynchronously fetches and starts all active camera streams."""
-    logger.info("Initializing all camera streams asynchronously...")
+# async def async_initialize_all_camera_streams():
+#     """Asynchronously fetches and starts all active camera streams."""
+#     logger.info("Initializing all camera streams asynchronously...")
     
-    active_cameras = await asyncio.to_thread(lambda: list(Camera.objects.filter(is_active=True).order_by("id")))
+#     active_cameras = await asyncio.to_thread(lambda: list(Camera.objects.filter(is_active=True).order_by("id")))
 
-    for camera in active_cameras:
-        if camera.id not in active_streams:
-            await asyncio.to_thread(start_camera_process, camera.id, camera.get_rtsp_url())
+#     for camera in active_cameras:
+#         if camera.id not in active_streams:
+#             await asyncio.to_thread(start_camera_process, camera.id, camera.get_rtsp_url())
 
-    logger.info("All camera streams initialized.")
+#     logger.info("All camera streams initialized.")
 
 # -----------------------------------------
 # MULTIPROCESS FUNCTION: Start Camera Stream
@@ -659,35 +659,22 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
 # FUNCTION: Cleanup Camera Process
 # -----------------------------------------
 def cleanup_camera_stream(camera_id):
-    """Stops the camera process and removes buffers."""
+    """Stops the camera process and removes buffers safely."""
     if camera_id in active_streams:
-        pid = active_streams[camera_id]
-        try:
-            os.kill(pid, signal.SIGTERM)  # Graceful termination
-        except ProcessLookupError:
-            pass  # Process already terminated
+        pid = active_streams.get(camera_id)  # Use `.get()` to avoid KeyError
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)  # Graceful termination
+                logger.info(f"Terminated process {pid} for camera {camera_id}")
+            except ProcessLookupError:
+                logger.warning(f"Process {pid} for camera {camera_id} not found.")
         
-        del active_streams[camera_id]
+        active_streams.pop(camera_id, None)  # Safely remove from dict
 
     if camera_id in frame_buffers:
-        del frame_buffers[camera_id]
+        frame_buffers.pop(camera_id, None)  # Remove frame buffer safely
 
     logger.info(f"Camera {camera_id} process cleaned up.")
-
-# -----------------------------------------
-# FUNCTION: Cleanup All Streams
-# -----------------------------------------
-def cleanup_all_streams(*args):
-    """Terminates all active camera processes on shutdown."""
-    logger.info("Shutting down all camera streams...")
-    for camera_id in list(active_streams.keys()):
-        cleanup_camera_stream(camera_id)
-    logger.info("All camera processes terminated.")
-    exit(0)
-
-# Register cleanup function on exit
-signal.signal(signal.SIGINT, cleanup_all_streams)
-signal.signal(signal.SIGTERM, cleanup_all_streams)
 
 # -----------------------------------------
 # FUNCTION: Restart Camera Process
@@ -769,6 +756,16 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_stream_urls = {}
 
+        # Identify cameras that should be stopped (previous section cameras)
+        current_camera_ids = set(camera.id for camera in cameras)
+        active_camera_ids = set(active_streams.keys())
+
+        cameras_to_stop = active_camera_ids - current_camera_ids  # Cameras not in the new section
+
+        for camera_id in cameras_to_stop:
+            cleanup_camera_stream(camera_id)  # Stop the previous section's cameras
+
+        # Start cameras for the new section
         for camera in cameras:
             if camera.id not in active_streams:
                 start_camera_process(camera.id, camera.get_rtsp_url())
@@ -780,7 +777,7 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
 # -----------------------------------------
 # STARTUP: Run Async Initialization
 # -----------------------------------------
-asyncio.run(async_initialize_all_camera_streams())
+# asyncio.run(async_initialize_all_camera_streams())
 
 
 #####################################################################################################################################

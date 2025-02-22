@@ -31,7 +31,7 @@ def start_camera_stream(self, camera_id):
 
     ffmpeg_cmd = [
         "ffmpeg", "-hwaccel", "cuda", "-rtsp_transport", "tcp", "-i", camera_url,
-        "-an", "-vf", "fps=3,scale=480:360,format=yuv420p",
+        "-an", "-vf", "fps=5,scale=640:480,format=yuv420p",
         "-pix_fmt", "yuv420p", "-c:v", "h264_nvenc", "-preset", "fast", "-gpu", "0", "-f", "image2pipe", "-"
     ]
     process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)

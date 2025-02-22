@@ -475,23 +475,25 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
     """Handles multi-camera streaming for sections."""
     
     def retrieve(self, request, pk=None):
-        """Starts/stops camera streams per section."""
+        """Handles starting/stopping camera streams per section."""
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_stream_urls = {}
 
+        # Check if section has changed
         current_section = cache.get(CURRENT_SECTION_KEY)
         if current_section != pk:
+            # Stop all previous streams
             previous_cameras = Camera.objects.filter(section_id=current_section, is_active=True)
             for camera in previous_cameras:
                 cleanup_camera_stream.delay(camera.id)
-
+            
+            # Update current section in cache
             cache.set(CURRENT_SECTION_KEY, pk)
 
-        # Start new section cameras with a delay
-        for i, camera in enumerate(cameras):
-            start_camera_stream.apply_async(args=[camera.id], countdown=i * 2)  # Staggered startup
-
+        # Start all new section cameras
+        for camera in cameras:
+            start_camera_stream.delay(camera.id)
             active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
 
         return JsonResponse({"message": "Camera feeds started", "streams": active_stream_urls}, status=status.HTTP_200_OK)

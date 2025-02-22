@@ -31,15 +31,15 @@ def start_camera_stream(self, camera_id):
 
     ffmpeg_cmd = [
         "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
-        "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
-        "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+        "-an", "-vf", "fps=3,scale=480:360", "-f", "image2pipe",
+        "-pix_fmt", "bgr24", "-vcodec", "h264_nvenc", "-"
     ]
     process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
 
     # Store process ID in Redis
     cache.set(PROCESS_CACHE_KEY.format(camera_id=camera_id), process.pid)
 
-    frame_size = 640 * 480 * 3
+    frame_size = 480 * 360 * 3
     last_frame_time = time.time()
 
     try:
@@ -51,8 +51,8 @@ def start_camera_stream(self, camera_id):
                     return
                 continue
 
-            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
-            _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((360, 480, 3))
+            _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
 
             # Store latest frame in Redis
             cache.set(FRAME_CACHE_KEY.format(camera_id=camera_id), jpeg.tobytes(), timeout=10)

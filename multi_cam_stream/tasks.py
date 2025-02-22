@@ -1,61 +1,51 @@
-import cv2
-import time
-import redis
-import subprocess
-import numpy as np
-from celery import shared_task
-from django.core.cache import cache
-from .models import Camera
+# from celery import shared_task
+# import subprocess
+# import numpy as np
+# import cv2
+# import time
+# from django.core.cache import cache
+# from .utils import store_frame  # Function for storing frames in Redis
 
-FRAME_TIMEOUT = 60  # Timeout for unresponsive cameras
-REDIS_FRAME_KEY = "camera_stream:{camera_id}"
+# FRAME_TIMEOUT = 5  # Time before retrying FFmpeg
 
-def store_frame(camera_id, frame):
-    """Store the latest frame in Redis."""
-    cache.set(REDIS_FRAME_KEY.format(camera_id=camera_id), frame, timeout=60)
+# @shared_task(bind=True)
+# def stream_camera_ffmpeg(self, camera_id, camera_url, section_id):
+#     """Starts an FFmpeg process for a camera and maintains frame queue using Redis."""
 
-def get_latest_frame(camera_id):
-    """Retrieve the latest frame from Redis."""
-    return cache.get(REDIS_FRAME_KEY.format(camera_id=camera_id))
+#     # Abort if section is not active
+#     if cache.get("active_section") != str(section_id):
+#         return  
 
-@shared_task(bind=True)
-def stream_camera_ffmpeg(self, camera_id, camera_url, section_id):
-    """Starts an FFmpeg process for a camera and maintains frame queue using Redis."""
-    
-    current_active_section = cache.get("active_section")
+#     ffmpeg_cmd = [
+#         "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
+#         "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
+#         "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+#     ]
 
-    # If the section has changed, terminate the process
-    if current_active_section and current_active_section != section_id:
-        return
+#     process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+#     frame_size = 640 * 480 * 3
+#     last_frame_time = time.time()
 
-    ffmpeg_cmd = [
-        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
-        "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
-        "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
-    ]
+#     while process.poll() is None:
+#         # If section is changed, terminate camera stream
+#         if cache.get("active_section") != str(section_id):
+#             process.terminate()
+#             cache.delete(f"camera_active:{camera_id}")  # Remove camera's active flag
+#             return
 
-    process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-    frame_size = 640 * 480 * 3
-    last_frame_time = time.time()
+#         raw_frame = process.stdout.read(frame_size)
+#         if len(raw_frame) != frame_size:
+#             if time.time() - last_frame_time > FRAME_TIMEOUT:
+#                 process.terminate()
+#                 self.retry(countdown=5, max_retries=3)  # Retry if timeout
+#                 return
+#             continue
 
-    while process.poll() is None:
-        # Check if section changed mid-stream
-        if cache.get("active_section") != section_id:
-            process.terminate()
-            return
+#         frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
+#         _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
 
-        raw_frame = process.stdout.read(frame_size)
-        if len(raw_frame) != frame_size:
-            if time.time() - last_frame_time > FRAME_TIMEOUT:
-                process.terminate()
-                self.retry(countdown=5, max_retries=3)  # Retry task
-                return
-            continue
+#         store_frame(camera_id, jpeg.tobytes())  # Store frame in Redis
+#         last_frame_time = time.time()
 
-        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
-        _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-
-        store_frame(camera_id, jpeg.tobytes())
-        last_frame_time = time.time()
-
-    process.terminate()
+#     process.terminate()
+#     cache.delete(f"camera_active:{camera_id}")  # Ensure camera flag is removed

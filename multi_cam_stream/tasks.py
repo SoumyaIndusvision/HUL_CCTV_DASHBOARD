@@ -1,51 +1,91 @@
-# from celery import shared_task
-# import subprocess
-# import numpy as np
-# import cv2
-# import time
-# from django.core.cache import cache
-# from .utils import store_frame  # Function for storing frames in Redis
+import os
+import cv2
+import time
+import signal
+import subprocess
+import numpy as np
+from .models import Camera
+from django.core.cache import cache
+from django.conf import settings
+from celery import shared_task
 
-# FRAME_TIMEOUT = 5  # Time before retrying FFmpeg
 
-# @shared_task(bind=True)
-# def stream_camera_ffmpeg(self, camera_id, camera_url, section_id):
-#     """Starts an FFmpeg process for a camera and maintains frame queue using Redis."""
 
-#     # Abort if section is not active
-#     if cache.get("active_section") != str(section_id):
-#         return  
+FRAME_TIMEOUT = 60  # Camera timeout in seconds
 
-#     ffmpeg_cmd = [
-#         "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
-#         "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
-#         "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
-#     ]
+# Redis Cache Keys
+FRAME_CACHE_KEY = "camera_frame_{camera_id}"
+PROCESS_CACHE_KEY = "camera_process_{camera_id}"
 
-#     process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-#     frame_size = 640 * 480 * 3
-#     last_frame_time = time.time()
+# -----------------------------------------
+# Celery Task: Start Camera Streaming
+# -----------------------------------------
+@shared_task(bind=True)
+def start_camera_stream(self, camera_id):
+    """Starts a camera stream via FFmpeg and stores frames in Redis."""
+    camera = Camera.objects.filter(id=camera_id).first()
+    if not camera:
+        return f"Camera {camera_id} not found."
 
-#     while process.poll() is None:
-#         # If section is changed, terminate camera stream
-#         if cache.get("active_section") != str(section_id):
-#             process.terminate()
-#             cache.delete(f"camera_active:{camera_id}")  # Remove camera's active flag
-#             return
+    camera_url = camera.get_rtsp_url()
 
-#         raw_frame = process.stdout.read(frame_size)
-#         if len(raw_frame) != frame_size:
-#             if time.time() - last_frame_time > FRAME_TIMEOUT:
-#                 process.terminate()
-#                 self.retry(countdown=5, max_retries=3)  # Retry if timeout
-#                 return
-#             continue
+    ffmpeg_cmd = [
+        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
+        "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
+        "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+    ]
+    process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
 
-#         frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
-#         _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    # Store process ID in Redis
+    cache.set(PROCESS_CACHE_KEY.format(camera_id=camera_id), process.pid)
 
-#         store_frame(camera_id, jpeg.tobytes())  # Store frame in Redis
-#         last_frame_time = time.time()
+    frame_size = 640 * 480 * 3
+    last_frame_time = time.time()
 
-#     process.terminate()
-#     cache.delete(f"camera_active:{camera_id}")  # Ensure camera flag is removed
+    try:
+        while True:
+            raw_frame = process.stdout.read(frame_size)
+            if len(raw_frame) != frame_size:
+                if time.time() - last_frame_time > FRAME_TIMEOUT:
+                    restart_camera_stream.delay(camera_id)
+                    return
+                continue
+
+            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
+            _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+
+            # Store latest frame in Redis
+            cache.set(FRAME_CACHE_KEY.format(camera_id=camera_id), jpeg.tobytes(), timeout=10)
+
+            last_frame_time = time.time()
+
+    except Exception as e:
+        restart_camera_stream.delay(camera_id)
+    finally:
+        cleanup_camera_stream(camera_id)
+
+# -----------------------------------------
+# Celery Task: Restart Camera Stream
+# -----------------------------------------
+@shared_task(bind=True)
+def restart_camera_stream(self, camera_id):
+    """Restarts a camera stream if it fails."""
+    cleanup_camera_stream(camera_id)
+    time.sleep(2)  # Prevent rapid restart loops
+    start_camera_stream.delay(camera_id)
+
+# -----------------------------------------
+# Celery Task: Cleanup Camera Stream
+# -----------------------------------------
+@shared_task(bind=True)
+def cleanup_camera_stream(self, camera_id):
+    """Stops a running camera stream and clears Redis cache."""
+    process_pid = cache.get(PROCESS_CACHE_KEY.format(camera_id=camera_id))
+    if process_pid:
+        try:
+            os.kill(process_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        cache.delete(PROCESS_CACHE_KEY.format(camera_id=camera_id))
+    cache.delete(FRAME_CACHE_KEY.format(camera_id=camera_id))

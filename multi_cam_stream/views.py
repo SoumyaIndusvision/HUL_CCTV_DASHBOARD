@@ -16,11 +16,11 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from .models import Seracs, Section, Camera
 from .serializers import SeracSerializer, SectionSerializer, CameraSerializer
-import redis
+# import redis
 
-from .tasks import start_camera_stream, cleanup_camera_stream
-from django.core.cache import cache
-from celery.result import AsyncResult
+# from .tasks import start_camera_stream, cleanup_camera_stream
+# from django.core.cache import cache
+# from celery.result import AsyncResult
 
 logger = logging.getLogger(__name__)
 

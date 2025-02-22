@@ -570,16 +570,16 @@ class CameraViewSet(viewsets.ViewSet):
 
 ###########################################################################################################################################################
 
-# Constants
-MAX_CONCURRENT_STREAMS = 30
-FRAME_TIMEOUT = 60  # Camera timeout in seconds
+# # Constants
+# MAX_CONCURRENT_STREAMS = 30
+# FRAME_TIMEOUT = 60  # Camera timeout in seconds
 
-# Global Shared State (Using Manager)
-manager = mp.Manager()
-frame_buffers = manager.dict()  # {camera_id: Manager().list()}
-active_streams = manager.dict()  # {camera_id: process_pid}
+# # Global Shared State (Using Manager)
+# manager = mp.Manager()
+# frame_buffers = manager.dict()  # {camera_id: Manager().list()}
+# active_streams = manager.dict()  # {camera_id: process_pid}
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 
 # -----------------------------------------
 # ASYNC FUNCTION: Initialize All Camera Streams
@@ -615,7 +615,7 @@ def start_camera_process(camera_id, camera_url):
         return  # Process already running
     
     process = mp.Process(target=stream_camera_ffmpeg, args=(camera_id, camera_url, frame_buffers))
-    process.daemon = True
+    process.daemon = False
     process.start()
     active_streams[camera_id] = process.pid
 
@@ -626,7 +626,8 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
     """Starts an FFmpeg process for a camera and maintains the frame queue."""
     logger.info(f"Starting stream for camera {camera_id} at {camera_url}")
 
-    frame_buffers[camera_id] = manager.list()
+    if camera_id not in frame_buffers:
+        frame_buffers[camera_id] = manager.list()
     
     try:
         ffmpeg_cmd = [
@@ -689,8 +690,18 @@ def restart_camera_stream(camera_id):
     logger.info(f"Restarting camera {camera_id}...")
     time.sleep(2)
     camera = Camera.objects.filter(id=camera_id).first()
-    if camera:
-        start_camera_process(camera.id, camera.get_rtsp_url())
+    if not camera:
+        logger.warning(f"Camera {camera_id} not found. Skipping restart.")
+        return
+    
+    # Cleanup old processes if it exists
+    cleanup_camera_stream(camera_id)
+
+    # Delay restart to prevent rapid looping
+    time.sleep(2)
+
+    # Restart Camera
+    start_camera_process(camera.id, camera.get_rtsp_url())
 
 # -----------------------------------------
 # DJANGO VIEW: Serve Video Feed
@@ -709,15 +720,20 @@ def generate_frames(camera_id):
     """Yields latest frames for HTTP streaming."""
     while True:
         if camera_id in frame_buffers and frame_buffers[camera_id]:
-            try:
-                frame = frame_buffers[camera_id][-1]
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n'
-                       b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
-                       b'\r\n' + frame + b'\r\n')
-            except IndexError:
-                yield get_blank_frame()
-        else:
+            logger.warning(f"Camera {camera_id} buffer empty. Waiting...")
+            time.sleep(1)   # Avoid high CPU usage
+            continue
+        
+        try:
+            frame = frame_buffers[camera_id][-1]
+            yield (b'--frame\r\n'
+                    b'Content-Type: image/jpeg\r\n'
+                    b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
+                    b'\r\n' + frame + b'\r\n')
+        except IndexError:
+            yield get_blank_frame()
+        except KeyError:
+            logger.error(f"Frame buffer missing for camera {camera_id}. Retrying...")
             time.sleep(0.5)
 
 # -----------------------------------------

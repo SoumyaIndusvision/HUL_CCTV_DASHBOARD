@@ -441,11 +441,13 @@ FRAME_CACHE_KEY = "camera_frame_{camera_id}"
 CURRENT_SECTION_KEY = "current_section"
 
 def video_feed(request, camera_id):
-    """Django view for optimized video streaming."""
+    """Starts and streams camera feed via HTTP."""
     camera = get_object_or_404(Camera, id=camera_id)
 
-    # Start the camera process via Celery
-    start_camera_stream.delay(camera.id)
+    # Check if camera process is already running
+    process_pid = cache.get(FRAME_CACHE_KEY.format(camera_id=camera_id))
+    if not process_pid:
+        start_camera_stream.delay(camera.id)  # Start only if not running
 
     return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
 
@@ -473,25 +475,23 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
     """Handles multi-camera streaming for sections."""
     
     def retrieve(self, request, pk=None):
-        """Handles starting/stopping camera streams per section."""
+        """Starts/stops camera streams per section."""
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_stream_urls = {}
 
-        # Check if section has changed
         current_section = cache.get(CURRENT_SECTION_KEY)
         if current_section != pk:
-            # Stop all previous streams
             previous_cameras = Camera.objects.filter(section_id=current_section, is_active=True)
             for camera in previous_cameras:
                 cleanup_camera_stream.delay(camera.id)
-            
-            # Update current section in cache
+
             cache.set(CURRENT_SECTION_KEY, pk)
 
-        # Start all new section cameras
-        for camera in cameras:
-            start_camera_stream.delay(camera.id)
+        # Start new section cameras with a delay
+        for i, camera in enumerate(cameras):
+            start_camera_stream.apply_async(args=[camera.id], countdown=i * 2)  # Staggered startup
+
             active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
 
         return JsonResponse({"message": "Camera feeds started", "streams": active_stream_urls}, status=status.HTTP_200_OK)

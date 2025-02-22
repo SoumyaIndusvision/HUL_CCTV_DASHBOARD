@@ -625,18 +625,19 @@ def start_camera_process(camera_id, camera_url):
 def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
     """Starts an FFmpeg process for a camera and maintains the frame queue."""
     logger.info(f"Starting stream for camera {camera_id} at {camera_url}")
-    
-    frame_buffers[camera_id] = manager.list()
+
+    if camera_id not in frame_buffers:
+        frame_buffers[camera_id] = manager.list()
     
     try:
         ffmpeg_cmd = [
             "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
-            "-an", "-vf", "fps=3,scale=320:240", "-f", "image2pipe",
+            "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
             "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
         ]
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
         active_streams[camera_id] = process.pid
-        frame_size = 320 * 240 * 3
+        frame_size = 640 * 480 * 3
         last_frame_time = time.time()
 
         while True:
@@ -648,7 +649,7 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
                     return  
                 continue
 
-            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((240, 320, 3))
+            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
             _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
 
             if len(frame_buffers[camera_id]) >= 60:
@@ -693,8 +694,13 @@ def restart_camera_stream(camera_id):
         logger.warning(f"Camera {camera_id} not found. Skipping restart.")
         return
     
+    # Cleanup old processes if it exists
     cleanup_camera_stream(camera_id)
+
+    # Delay restart to prevent rapid looping
     time.sleep(2)
+
+    # Restart Camera
     start_camera_process(camera.id, camera.get_rtsp_url())
 
 # -----------------------------------------
@@ -703,13 +709,8 @@ def restart_camera_stream(camera_id):
 def video_feed(request, camera_id):
     """Django view for optimized video streaming."""
     camera = get_object_or_404(Camera, id=camera_id)
-
-    if camera_id not in frame_buffers:
-        frame_buffers[camera_id] = manager.list()  # Initialize empty list
-    
     if camera_id not in active_streams:
         start_camera_process(camera.id, camera.get_rtsp_url())
-
     return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
 
 # -----------------------------------------
@@ -729,16 +730,14 @@ def generate_frames(camera_id):
                 yield get_blank_frame()
             except KeyError:
                 logger.error(f"Frame buffer missing for camera {camera_id}. Retrying...")
-                yield get_blank_frame()  # Return a blank frame instead of breaking
         else:
-            yield get_blank_frame()
             time.sleep(0.5)
 
 # -----------------------------------------
 # FUNCTION: Blank Frame
 # -----------------------------------------
 def get_blank_frame():
-    blank_image = np.zeros((240, 320, 3), dtype=np.uint8)
+    blank_image = np.zeros((480, 640, 3), dtype=np.uint8)
     _, jpeg = cv2.imencode(".jpg", blank_image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     return jpeg.tobytes()
 
@@ -757,16 +756,10 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
                 cleanup_camera_stream(camera_id)
             current_section.value = pk
         
-        # Start new cameras
         for camera in cameras:
-            if camera.id not in frame_buffers:
-                frame_buffers[camera.id] = manager.list()  # Initialize buffer
             if camera.id not in active_streams:
                 start_camera_process(camera.id, camera.get_rtsp_url())
             active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
-        
-        # Wait for frames to populate before sending response
-        time.sleep(2)
 
         return JsonResponse({"message": "Camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)
     

@@ -2,11 +2,14 @@ import os
 import time
 import signal
 import subprocess
+import redis
 from django.core.cache import cache
 from celery import shared_task
 from .models import Camera
 
-# Redis keys
+# Redis Configuration
+redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
+FRAME_CACHE_KEY = "camera_frame_{camera_id}"
 PROCESS_CACHE_KEY = "camera_process_{camera_id}"
 UDP_PORT = 12345  # Change this port if needed
 
@@ -19,23 +22,26 @@ def start_camera_stream(self, camera_id):
 
     camera_url = camera.get_rtsp_url()
 
-    # FFmpeg command for GPU-accelerated processing
+    # Optimized FFmpeg command for GPU acceleration
     ffmpeg_cmd = [
-        "ffmpeg", "-hwaccel", "cuda", "-c:v", "h264_cuvid",
+        "ffmpeg", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-c:v", "h264_cuvid",  # Decode with Nvidia GPU
         "-rtsp_transport", "tcp", "-i", camera_url,
-        "-vf", "fps=5,scale_cuda=640:480",
-        "-c:v", "h264_nvenc", "-preset", "fast", "-gpu", "0",
+        "-vf", "fps=15,scale_npp=640:480",  # Ensure proper frame rate and scaling
+        "-c:v", "h264_nvenc", "-preset", "p4", "-gpu", "0",
+        "-b:v", "2M", "-bufsize", "4M",
         "-f", "mpegts", f"udp://localhost:{UDP_PORT}"
     ]
 
-    process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     # Store process ID in Redis
     cache.set(PROCESS_CACHE_KEY.format(camera_id=camera_id), process.pid)
 
     try:
         process.wait()  # Keep process running
-    except Exception:
+    except Exception as e:
+        print(f"Camera {camera_id} failed: {e}")
         restart_camera_stream.delay(camera_id)
     finally:
         cleanup_camera_stream(camera_id)

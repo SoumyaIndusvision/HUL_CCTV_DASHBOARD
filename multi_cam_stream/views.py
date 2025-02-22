@@ -6,6 +6,7 @@ import logging
 import asyncio
 import numpy as np
 import subprocess
+from collections import deque
 import multiprocessing as mp
 from django.http import StreamingHttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
@@ -432,10 +433,12 @@ class CameraViewSet(viewsets.ViewSet):
             return Response({"message": "Camera created", "status": status.HTTP_201_CREATED})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-
 # Constants
 MAX_CONCURRENT_STREAMS = 30
 FRAME_TIMEOUT = 60
+FRAME_WIDTH, FRAME_HEIGHT = 320, 240
+FRAME_SIZE = FRAME_WIDTH * FRAME_HEIGHT * 3
+FRAME_BUFFER_SIZE = 60
 
 # Global Shared State
 manager = mp.Manager()
@@ -444,45 +447,37 @@ active_streams = manager.dict()
 section_streams = manager.dict()  # {section_id: [camera_ids]}
 logger = logging.getLogger(__name__)
 
-# ----------------------------
-# FUNCTION: Start Camera Process
-# ----------------------------
 def start_camera_process(camera_id, camera_url):
+    """Starts a new camera streaming process if not already running."""
     if camera_id in active_streams:
         return  # Already running
-    process = mp.Process(target=stream_camera_ffmpeg, args=(camera_id, camera_url))
-    process.daemon = True
+    process = mp.Process(target=stream_camera_ffmpeg, args=(camera_id, camera_url), daemon=True)
     process.start()
     active_streams[camera_id] = process
 
-# ----------------------------
-# FUNCTION: Stream Camera via FFmpeg
-# ----------------------------
 def stream_camera_ffmpeg(camera_id, camera_url):
+    """Handles streaming of a camera feed via FFmpeg."""
     logger.info(f"Starting stream for camera {camera_id} at {camera_url}")
-    frame_buffers[camera_id] = manager.list()
+    frame_buffers[camera_id] = deque(maxlen=FRAME_BUFFER_SIZE)
     try:
         ffmpeg_cmd = [
             "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
-            "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
+            "-an", "-vf", f"fps=3,scale={FRAME_WIDTH}:{FRAME_HEIGHT}", "-f", "image2pipe",
             "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
         ]
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
         active_streams[camera_id] = process
-        frame_size = 320 * 240 * 3
         last_frame_time = time.time()
-
+        
         while True:
-            raw_frame = process.stdout.read(frame_size)
-            if len(raw_frame) != frame_size:
+            raw_frame = process.stdout.read(FRAME_SIZE)
+            if len(raw_frame) != FRAME_SIZE:
                 if time.time() - last_frame_time > FRAME_TIMEOUT:
                     restart_camera_stream(camera_id)
                     return
                 continue
-            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
-            _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
-            if len(frame_buffers[camera_id]) >= 60:
-                frame_buffers[camera_id].pop(0)
+            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((FRAME_HEIGHT, FRAME_WIDTH, 3))
+            _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
             frame_buffers[camera_id].append(jpeg.tobytes())
             last_frame_time = time.time()
     except Exception as e:
@@ -491,83 +486,65 @@ def stream_camera_ffmpeg(camera_id, camera_url):
     finally:
         cleanup_camera_stream(camera_id)
 
-# ----------------------------
-# FUNCTION: Cleanup Camera Process
-# ----------------------------
 def cleanup_camera_stream(camera_id):
+    """Cleans up resources for a camera stream."""
     if camera_id in active_streams:
-        process = active_streams[camera_id]
-        process.terminate()  # Faster termination
+        process = active_streams.pop(camera_id)
+        process.terminate()
         process.join(timeout=2)
-        del active_streams[camera_id]
-    if camera_id in frame_buffers:
-        del frame_buffers[camera_id]
+    frame_buffers.pop(camera_id, None)
     logger.info(f"Camera {camera_id} process cleaned up.")
 
-# ----------------------------
-# FUNCTION: Terminate All Streams for a Section
-# ----------------------------
 def terminate_section_streams(section_id):
-    if section_id in section_streams:
-        for camera_id in section_streams[section_id]:
-            cleanup_camera_stream(camera_id)
-        del section_streams[section_id]
+    """Terminates all active camera streams within a section."""
+    for camera_id in section_streams.pop(section_id, []):
+        cleanup_camera_stream(camera_id)
     logger.info(f"All streams for section {section_id} terminated.")
 
-# ----------------------------
-# FUNCTION: Restart Camera Process
-# ----------------------------
 def restart_camera_stream(camera_id):
+    """Restarts a camera stream."""
     logger.info(f"Restarting camera {camera_id}...")
     time.sleep(2)
     camera = Camera.objects.filter(id=camera_id).first()
     if camera:
         start_camera_process(camera.id, camera.get_rtsp_url())
 
-# ----------------------------
-# FUNCTION: Generate Video Feed
-# ----------------------------
 def generate_frames(camera_id):
+    """Yields frames for the video feed."""
     while True:
         if camera_id in frame_buffers and frame_buffers[camera_id]:
             try:
                 frame = frame_buffers[camera_id][-1]
                 yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n' b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n' b'\r\n' + frame + b'\r\n')
             except IndexError:
-                yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n' b'\r\n' + get_blank_frame() + b'\r\n')
+                yield blank_frame_response()
         else:
             time.sleep(0.5)
 
-# ----------------------------
-# FUNCTION: Get Blank Frame
-# ----------------------------
-def get_blank_frame():
-    blank_image = np.zeros((480, 640, 3), dtype=np.uint8)
-    _, jpeg = cv2.imencode(".jpg", blank_image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    return jpeg.tobytes()
+def blank_frame_response():
+    """Returns a blank frame."""
+    blank_image = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+    _, jpeg = cv2.imencode(".jpg", blank_image, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+    return b'--frame\r\n' b'Content-Type: image/jpeg\r\n' b'\r\n' + jpeg.tobytes() + b'\r\n'
 
-# ----------------------------
-# FUNCTION: API Video Feed
-# ----------------------------
 def video_feed(request, camera_id):
+    """Returns a video feed response."""
     get_object_or_404(Camera, id=camera_id)
     return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
 
-# ----------------------------
-# CLASS: MultiCameraStreamViewSet
-# ----------------------------
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     @swagger_auto_schema(
         operation_summary="Retrieve Active Camera Streams for a Section",
         responses={200: openapi.Response("Active camera streams"), 404: openapi.Response("Section not found")}
     )
     def retrieve(self, request, pk=None):
+        """Retrieves active camera streams for a given section."""
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_stream_urls = {}
 
         # Terminate previous section streams
-        for sec_id in section_streams.keys():
+        for sec_id in list(section_streams.keys()):
             if sec_id != pk:
                 terminate_section_streams(sec_id)
 

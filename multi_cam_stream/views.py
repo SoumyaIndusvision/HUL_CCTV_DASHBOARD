@@ -543,7 +543,9 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
                     cleanup_camera_stream(camera_id)
         
         # Start new section streams
-        section_streams[pk] = []
+        if pk not in section_streams:
+            section_streams[pk] = []
+            
         for camera in cameras:
             if camera.id not in active_streams:
                 start_camera_process(camera.id, str(camera.get_rtsp_url()))

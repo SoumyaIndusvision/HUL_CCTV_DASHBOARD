@@ -600,11 +600,17 @@ class CameraViewSet(viewsets.ViewSet):
 MAX_CONCURRENT_STREAMS = 30
 FRAME_TIMEOUT = 60  # Camera timeout in seconds
 
+# Set multiprocessing start method
+mp.set_start_method('spawn', force=True)
+
 # Global Shared State (Using Manager)
 manager = mp.Manager()
 frame_buffers = manager.dict()  # {camera_id: Manager().list()}
 active_streams = manager.dict()  # {camera_id: process_pid}
 current_section = manager.Value("i", -1)  # Track active section ID
+
+# Logger
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------
 # MULTIPROCESS FUNCTION: Start Camera Stream
@@ -613,9 +619,9 @@ def start_camera_process(camera_id, camera_url):
     """Spawns a new process for handling a camera stream if not already running."""
     if camera_id in active_streams:
         return  # Process already running
-    
+
     process = mp.Process(target=stream_camera_ffmpeg, args=(camera_id, camera_url, frame_buffers))
-    process.daemon = False
+    process.daemon = False  # Fix: Prevent daemon process from blocking child processes
     process.start()
     active_streams[camera_id] = process.pid
 
@@ -628,7 +634,7 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
 
     if camera_id not in frame_buffers:
         frame_buffers[camera_id] = manager.list()
-    
+
     try:
         ffmpeg_cmd = [
             "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
@@ -654,7 +660,7 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
 
             if len(frame_buffers[camera_id]) >= 60:
                 frame_buffers[camera_id].pop(0)
-            
+
             frame_buffers[camera_id].append(jpeg.tobytes())
             last_frame_time = time.time()
 
@@ -693,7 +699,7 @@ def restart_camera_stream(camera_id):
     if not camera:
         logger.warning(f"Camera {camera_id} not found. Skipping restart.")
         return
-    
+
     # Cleanup old processes if it exists
     cleanup_camera_stream(camera_id)
 
@@ -702,6 +708,14 @@ def restart_camera_stream(camera_id):
 
     # Restart Camera
     start_camera_process(camera.id, camera.get_rtsp_url())
+
+# -----------------------------------------
+# MULTIPROCESSING POOL: Manage Multiple Streams Efficiently
+# -----------------------------------------
+def start_camera_streams(cameras):
+    """Use a process pool to handle multiple camera streams."""
+    with mp.Pool(processes=4) as pool:  # Adjust pool size based on CPU resources
+        pool.starmap(start_camera_process, [(camera.id, camera.get_rtsp_url()) for camera in cameras])
 
 # -----------------------------------------
 # DJANGO VIEW: Serve Video Feed
@@ -750,15 +764,16 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_stream_urls = {}
-        
+
         if current_section.value != pk:
             for camera_id in list(active_streams.keys()):
                 cleanup_camera_stream(camera_id)
             current_section.value = pk
-        
+
+        # Use multiprocessing pool to start streams efficiently
+        start_camera_streams(cameras)
+
         for camera in cameras:
-            if camera.id not in active_streams:
-                start_camera_process(camera.id, camera.get_rtsp_url())
             active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
 
         return JsonResponse({"message": "Camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)

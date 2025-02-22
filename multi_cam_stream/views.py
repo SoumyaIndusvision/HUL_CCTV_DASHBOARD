@@ -16,8 +16,8 @@ from drf_yasg import openapi
 from .models import Seracs, Section, Camera
 from .serializers import SeracSerializer, SectionSerializer, CameraSerializer
 
-from .tasks import stream_camera_ffmpeg
-from django.core.cache import cache
+# from .tasks import stream_camera_ffmpeg
+# from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
 

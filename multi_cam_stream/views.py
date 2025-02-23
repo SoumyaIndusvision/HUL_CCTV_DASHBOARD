@@ -439,11 +439,15 @@ class CameraViewSet(viewsets.ViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 ################## MAIN CODE ##################
+# -----------------------------------------
 # Constants
+# -----------------------------------------
 MAX_CONCURRENT_STREAMS = 30
 FRAME_TIMEOUT = 60  # Camera timeout in seconds
 
+# -----------------------------------------
 # Global Shared State (Using Manager)
+# -----------------------------------------
 manager = mp.Manager()
 frame_buffers = manager.dict()  # {camera_id: Manager().list()}
 active_streams = manager.dict()  # {camera_id: process_pid}
@@ -494,8 +498,8 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
             raw_frame = process.stdout.read(frame_size)
             if len(raw_frame) != frame_size:
                 if time.time() - last_frame_time > FRAME_TIMEOUT:
-                    logger.warning(f"Camera {camera_id} unresponsive. Restarting...")
-                    restart_camera_stream(camera_id)
+                    logger.warning(f"Camera {camera_id} unresponsive. Stopping...")
+                    cleanup_camera_stream(camera_id)
                     return  
                 continue
 
@@ -510,7 +514,6 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
 
     except Exception as e:
         logger.error(f"Error in stream for camera {camera_id}: {e}")
-        restart_camera_stream(camera_id)
     finally:
         cleanup_camera_stream(camera_id)
 
@@ -526,36 +529,20 @@ def cleanup_camera_stream(camera_id):
                 proc = psutil.Process(pid)
                 if proc.is_running():
                     proc.terminate()
-                    proc.wait(timeout=5)
-                    logger.info(f"Terminated process {pid} for camera {camera_id}")
-            except (psutil.NoSuchProcess, psutil.TimeoutExpired) as e:
-                logger.warning(f"Failed to terminate process {pid} for camera {camera_id}: {e}")
-                os.kill(pid, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=5)  # Graceful shutdown
+                        logger.info(f"Terminated process {pid} for camera {camera_id}")
+                    except psutil.TimeoutExpired:
+                        logger.warning(f"Process {pid} for camera {camera_id} did not terminate. Killing...")
+                        proc.kill()  # Force kill if terminate() fails
+                        proc.wait(timeout=3)  # Ensure it is killed
+            except psutil.NoSuchProcess:
+                logger.warning(f"Process {pid} for camera {camera_id} already exited.")
+            except Exception as e:
+                logger.error(f"Error while terminating camera {camera_id} process {pid}: {e}")
 
     frame_buffers.pop(camera_id, None)
     logger.info(f"Camera {camera_id} process cleaned up.")
-
-# -----------------------------------------
-# FUNCTION: Restart Camera Process
-# -----------------------------------------
-def restart_camera_stream(camera_id):
-    """Restarts a camera stream after failure."""
-    logger.info(f"Restarting camera {camera_id}...")
-    time.sleep(2)
-
-    camera = Camera.objects.filter(id=camera_id).first()
-    if not camera:
-        logger.warning(f"Camera {camera_id} not found. Skipping restart.")
-        return
-    
-    # Cleanup old processes
-    cleanup_camera_stream(camera_id)
-    
-    # Delay restart to prevent rapid looping
-    time.sleep(2)
-
-    # Restart Camera
-    start_camera_process(camera.id, camera.get_rtsp_url())
 
 # -----------------------------------------
 # DJANGO VIEW: Serve Video Feed
@@ -600,20 +587,29 @@ def get_blank_frame():
 # -----------------------------------------
 class MultiCameraStreamViewSet(viewsets.ViewSet):
     """Handles multi-camera streaming for sections."""
-    
+
     def retrieve(self, request, pk=None):
+        """Switches the active section and manages camera streams accordingly."""
         section = get_object_or_404(Section, id=pk)
         cameras = Camera.objects.filter(section=section, is_active=True)
         active_stream_urls = {}
 
         with section_lock:
             if current_section.value != pk:
-                logger.info(f"Switching from section {current_section.value} to section {pk}. Stopping old cameras.")
+                logger.info(f"Switching from section {current_section.value} to section {pk}. Stopping outdated cameras.")
 
-                # Stop previous section cameras using ThreadPoolExecutor for parallel execution
+                # Get all cameras in the new section
+                new_section_cameras = set(cameras.values_list("id", flat=True))
+                current_active_cameras = set(active_streams.keys())
+
+                # Determine which cameras should be stopped (those not in the new section)
+                cameras_to_stop = current_active_cameras - new_section_cameras
+
+                # Stop only the cameras that are no longer needed
                 with ThreadPoolExecutor(max_workers=5) as executor:
-                    executor.map(cleanup_camera_stream, list(active_streams.keys()))
+                    executor.map(cleanup_camera_stream, cameras_to_stop)
 
+                # Update current active section
                 current_section.value = pk
 
         # Start new section cameras
@@ -623,7 +619,10 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
 
             active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
 
-        return JsonResponse({"message": "Camera feeds updated", "streams": active_stream_urls}, status=status.HTTP_200_OK)
+        return JsonResponse(
+            {"message": "Camera feeds updated", "streams": active_stream_urls},
+            status=status.HTTP_200_OK,
+        )
 
 ################## CELERY IMPLEMENTATION ##################
 

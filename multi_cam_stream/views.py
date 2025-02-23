@@ -501,7 +501,7 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
                 if time.time() - last_frame_time > FRAME_TIMEOUT:
                     logger.warning(f"Camera {camera_id} unresponsive. Stopping...")
                     cleanup_camera_stream(camera_id)
-                    return  
+                    break  # 🚀 Ensure the loop exits
                 continue
 
             frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
@@ -517,6 +517,7 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
         logger.error(f"Error in stream for camera {camera_id}: {e}")
     finally:
         cleanup_camera_stream(camera_id)
+        return 
 
 # -----------------------------------------
 # FUNCTION: Cleanup Camera Process

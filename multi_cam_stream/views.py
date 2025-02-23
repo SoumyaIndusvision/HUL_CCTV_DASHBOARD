@@ -468,7 +468,7 @@ def start_camera_process(camera_id, camera_url):
         process = mp.Process(target=stream_camera_ffmpeg, args=(camera_id, camera_url, frame_buffers))
         process.daemon = False
         process.start()
-        active_streams[camera_id] = process.pid
+        active_streams[camera_id] = process  # Store full process object, not just pid
         logger.info(f"Started streaming process {process.pid} for camera {camera_id}")
     except Exception as e:
         logger.error(f"Failed to start camera {camera_id}: {e}")
@@ -482,15 +482,17 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
 
     if camera_id not in frame_buffers:
         frame_buffers[camera_id] = manager.list()
-    
+
     try:
         ffmpeg_cmd = [
             "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
             "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
             "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
         ]
-        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-        active_streams[camera_id] = process.pid
+        
+        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**8)
+        active_streams[camera_id] = process  # Store full process object, not just pid
+
         frame_size = 640 * 480 * 3
         last_frame_time = time.time()
 
@@ -523,23 +525,21 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
 def cleanup_camera_stream(camera_id):
     """Stops the camera process and removes buffers safely."""
     if camera_id in active_streams:
-        pid = active_streams.pop(camera_id, None)
-        if pid:
+        process = active_streams.pop(camera_id, None)  # Retrieve stored process object
+
+        if process:
             try:
-                proc = psutil.Process(pid)
-                if proc.is_running():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)  # Graceful shutdown
-                        logger.info(f"Terminated process {pid} for camera {camera_id}")
-                    except psutil.TimeoutExpired:
-                        logger.warning(f"Process {pid} for camera {camera_id} did not terminate. Killing...")
-                        proc.kill()  # Force kill if terminate() fails
-                        proc.wait(timeout=3)  # Ensure it is killed
-            except psutil.NoSuchProcess:
-                logger.warning(f"Process {pid} for camera {camera_id} already exited.")
+                if process.is_alive():  # Check if process is still running
+                    process.terminate()  # Graceful shutdown
+                    process.join(timeout=5)  # Wait for process to stop
+
+                if process.is_alive():  # If still running, force kill
+                    logger.warning(f"Process {process.pid} for camera {camera_id} did not terminate. Killing...")
+                    process.kill()  
+                    process.join(timeout=3)  # Ensure it is killed
+
             except Exception as e:
-                logger.error(f"Error while terminating camera {camera_id} process {pid}: {e}")
+                logger.error(f"Error while terminating camera {camera_id} process {process.pid}: {e}")
 
     frame_buffers.pop(camera_id, None)
     logger.info(f"Camera {camera_id} process cleaned up.")

@@ -16,8 +16,11 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from .models import Seracs, Section, Camera
 from .serializers import SeracSerializer, SectionSerializer, CameraSerializer
-# import redis
+import psutil
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Lock
 
+# import redis
 # from .tasks import start_camera_stream, cleanup_camera_stream
 # from django.core.cache import cache
 # from celery.result import AsyncResult
@@ -434,7 +437,194 @@ class CameraViewSet(viewsets.ViewSet):
             serializer.save()
             return Response({"message": "Camera created", "status": status.HTTP_201_CREATED})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+################## MAIN CODE ##################
+# Constants
+MAX_CONCURRENT_STREAMS = 30
+FRAME_TIMEOUT = 60  # Camera timeout in seconds
+
+# Global Shared State (Using Manager)
+manager = mp.Manager()
+frame_buffers = manager.dict()  # {camera_id: Manager().list()}
+active_streams = manager.dict()  # {camera_id: process_pid}
+current_section = manager.Value("i", -1)  # Track active section ID
+section_lock = Lock()
+
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------
+# FUNCTION: Start Camera Stream
+# -----------------------------------------
+def start_camera_process(camera_id, camera_url):
+    """Starts a new camera stream process if not already running."""
+    if camera_id in active_streams:
+        return  # Process already running
     
+    try:
+        process = mp.Process(target=stream_camera_ffmpeg, args=(camera_id, camera_url, frame_buffers))
+        process.daemon = False
+        process.start()
+        active_streams[camera_id] = process.pid
+        logger.info(f"Started streaming process {process.pid} for camera {camera_id}")
+    except Exception as e:
+        logger.error(f"Failed to start camera {camera_id}: {e}")
+
+# -----------------------------------------
+# FUNCTION: Stream Camera using FFmpeg
+# -----------------------------------------
+def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
+    """Handles streaming a camera using FFmpeg."""
+    logger.info(f"Starting stream for camera {camera_id} at {camera_url}")
+
+    if camera_id not in frame_buffers:
+        frame_buffers[camera_id] = manager.list()
+    
+    try:
+        ffmpeg_cmd = [
+            "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url,
+            "-an", "-vf", "fps=5,scale=640:480", "-f", "image2pipe",
+            "-pix_fmt", "bgr24", "-vcodec", "rawvideo", "-"
+        ]
+        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+        active_streams[camera_id] = process.pid
+        frame_size = 640 * 480 * 3
+        last_frame_time = time.time()
+
+        while True:
+            raw_frame = process.stdout.read(frame_size)
+            if len(raw_frame) != frame_size:
+                if time.time() - last_frame_time > FRAME_TIMEOUT:
+                    logger.warning(f"Camera {camera_id} unresponsive. Restarting...")
+                    restart_camera_stream(camera_id)
+                    return  
+                continue
+
+            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
+            _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+
+            if len(frame_buffers[camera_id]) >= 60:
+                frame_buffers[camera_id].pop(0)
+            
+            frame_buffers[camera_id].append(jpeg.tobytes())
+            last_frame_time = time.time()
+
+    except Exception as e:
+        logger.error(f"Error in stream for camera {camera_id}: {e}")
+        restart_camera_stream(camera_id)
+    finally:
+        cleanup_camera_stream(camera_id)
+
+# -----------------------------------------
+# FUNCTION: Cleanup Camera Process
+# -----------------------------------------
+def cleanup_camera_stream(camera_id):
+    """Stops the camera process and removes buffers safely."""
+    if camera_id in active_streams:
+        pid = active_streams.pop(camera_id, None)
+        if pid:
+            try:
+                proc = psutil.Process(pid)
+                if proc.is_running():
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    logger.info(f"Terminated process {pid} for camera {camera_id}")
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired) as e:
+                logger.warning(f"Failed to terminate process {pid} for camera {camera_id}: {e}")
+                os.kill(pid, signal.SIGKILL)
+
+    frame_buffers.pop(camera_id, None)
+    logger.info(f"Camera {camera_id} process cleaned up.")
+
+# -----------------------------------------
+# FUNCTION: Restart Camera Process
+# -----------------------------------------
+def restart_camera_stream(camera_id):
+    """Restarts a camera stream after failure."""
+    logger.info(f"Restarting camera {camera_id}...")
+    time.sleep(2)
+
+    camera = Camera.objects.filter(id=camera_id).first()
+    if not camera:
+        logger.warning(f"Camera {camera_id} not found. Skipping restart.")
+        return
+    
+    # Cleanup old processes
+    cleanup_camera_stream(camera_id)
+    
+    # Delay restart to prevent rapid looping
+    time.sleep(2)
+
+    # Restart Camera
+    start_camera_process(camera.id, camera.get_rtsp_url())
+
+# -----------------------------------------
+# DJANGO VIEW: Serve Video Feed
+# -----------------------------------------
+def video_feed(request, camera_id):
+    """Django view for optimized video streaming."""
+    camera = get_object_or_404(Camera, id=camera_id)
+    if camera_id not in active_streams:
+        start_camera_process(camera.id, camera.get_rtsp_url())
+    return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
+
+# -----------------------------------------
+# FUNCTION: Generate Video Feed Frames
+# -----------------------------------------
+def generate_frames(camera_id):
+    """Yields latest frames for HTTP streaming."""
+    while True:
+        if camera_id in frame_buffers and frame_buffers[camera_id]:
+            try:
+                frame = frame_buffers[camera_id][-1]
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
+                       b'\r\n' + frame + b'\r\n')
+            except IndexError:
+                yield get_blank_frame()
+            except KeyError:
+                logger.error(f"Frame buffer missing for camera {camera_id}. Retrying...")
+        else:
+            time.sleep(0.5)
+
+# -----------------------------------------
+# FUNCTION: Blank Frame
+# -----------------------------------------
+def get_blank_frame():
+    blank_image = np.zeros((480, 640, 3), dtype=np.uint8)
+    _, jpeg = cv2.imencode(".jpg", blank_image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    return jpeg.tobytes()
+
+# -----------------------------------------
+# API VIEW: Multi-Camera Streaming
+# -----------------------------------------
+class MultiCameraStreamViewSet(viewsets.ViewSet):
+    """Handles multi-camera streaming for sections."""
+    
+    def retrieve(self, request, pk=None):
+        section = get_object_or_404(Section, id=pk)
+        cameras = Camera.objects.filter(section=section, is_active=True)
+        active_stream_urls = {}
+
+        with section_lock:
+            if current_section.value != pk:
+                logger.info(f"Switching from section {current_section.value} to section {pk}. Stopping old cameras.")
+
+                # Stop previous section cameras using ThreadPoolExecutor for parallel execution
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    executor.map(cleanup_camera_stream, list(active_streams.keys()))
+
+                current_section.value = pk
+
+        # Start new section cameras
+        for camera in cameras:
+            if camera.id not in active_streams:
+                start_camera_process(camera.id, camera.get_rtsp_url())
+
+            active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
+
+        return JsonResponse({"message": "Camera feeds updated", "streams": active_stream_urls}, status=status.HTTP_200_OK)
+
 ################## CELERY IMPLEMENTATION ##################
 
 # # Redis Configuration
@@ -498,172 +688,172 @@ class CameraViewSet(viewsets.ViewSet):
 
 ################## CODE WITH MULTIPROCESSING ##################
 
-# Constants
-MAX_CONCURRENT_STREAMS = 30
-FRAME_TIMEOUT = 60  # Camera timeout in seconds
+# # Constants
+# MAX_CONCURRENT_STREAMS = 30
+# FRAME_TIMEOUT = 60  # Camera timeout in seconds
 
-# Global Shared State (Using Manager)
-manager = mp.Manager()
-frame_buffers = manager.dict()  # {camera_id: Manager().list()}
-active_streams = manager.dict()  # {camera_id: process_pid}
-current_section = manager.Value("i", -1)  # Track active section ID
+# # Global Shared State (Using Manager)
+# manager = mp.Manager()
+# frame_buffers = manager.dict()  # {camera_id: Manager().list()}
+# active_streams = manager.dict()  # {camera_id: process_pid}
+# current_section = manager.Value("i", -1)  # Track active section ID
 
-# -----------------------------------------
-# MULTIPROCESS FUNCTION: Start Camera Stream
-# -----------------------------------------
-def start_camera_process(camera_id, camera_url):
-    """Spawns a new process for handling a camera stream if not already running."""
-    if camera_id in active_streams:
-        return  # Process already running
+# # -----------------------------------------
+# # MULTIPROCESS FUNCTION: Start Camera Stream
+# # -----------------------------------------
+# def start_camera_process(camera_id, camera_url):
+#     """Spawns a new process for handling a camera stream if not already running."""
+#     if camera_id in active_streams:
+#         return  # Process already running
     
-    process = mp.Process(target=stream_camera_ffmpeg, args=(camera_id, camera_url, frame_buffers))
-    process.daemon = False
-    process.start()
-    active_streams[camera_id] = process.pid
+#     process = mp.Process(target=stream_camera_ffmpeg, args=(camera_id, camera_url, frame_buffers))
+#     process.daemon = False
+#     process.start()
+#     active_streams[camera_id] = process.pid
 
-# -----------------------------------------
-# MULTIPROCESS FUNCTION: Stream Camera using FFmpeg
-# -----------------------------------------
-def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
-    """Starts an FFmpeg process for a camera and maintains the frame queue."""
-    logger.info(f"Starting stream for camera {camera_id} at {camera_url}")
+# # -----------------------------------------
+# # MULTIPROCESS FUNCTION: Stream Camera using FFmpeg
+# # -----------------------------------------
+# def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
+#     """Starts an FFmpeg process for a camera and maintains the frame queue."""
+#     logger.info(f"Starting stream for camera {camera_id} at {camera_url}")
 
-    if camera_id not in frame_buffers:
-        frame_buffers[camera_id] = manager.list()
+#     if camera_id not in frame_buffers:
+#         frame_buffers[camera_id] = manager.list()
     
-    try:
-        ffmpeg_cmd = [
-            "ffmpeg", "-hwaccel", "cuda", "-c:v", "h264_cuvid", "-rtsp_transport", "tcp", "-i", camera_url,
-            "-an", "-vf", "fps=5,scale=640:480,format=yuv420p",
-            "-c:v", "h264_nvenc", "-preset", "fast", "-gpu", "0", "-f", "image2pipe", "-"
-        ]
-        process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-        active_streams[camera_id] = process.pid
-        frame_size = 640 * 480 * 3
-        last_frame_time = time.time()
+#     try:
+#         ffmpeg_cmd = [
+#             "ffmpeg", "-hwaccel", "cuda", "-c:v", "h264_cuvid", "-rtsp_transport", "tcp", "-i", camera_url,
+#             "-an", "-vf", "fps=5,scale=640:480,format=yuv420p",
+#             "-c:v", "h264_nvenc", "-preset", "fast", "-gpu", "0", "-f", "image2pipe", "-"
+#         ]
+#         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
+#         active_streams[camera_id] = process.pid
+#         frame_size = 640 * 480 * 3
+#         last_frame_time = time.time()
 
-        while True:
-            raw_frame = process.stdout.read(frame_size)
-            if len(raw_frame) != frame_size:
-                if time.time() - last_frame_time > FRAME_TIMEOUT:
-                    logger.warning(f"Camera {camera_id} unresponsive. Restarting...")
-                    restart_camera_stream(camera_id)
-                    return  
-                continue
+#         while True:
+#             raw_frame = process.stdout.read(frame_size)
+#             if len(raw_frame) != frame_size:
+#                 if time.time() - last_frame_time > FRAME_TIMEOUT:
+#                     logger.warning(f"Camera {camera_id} unresponsive. Restarting...")
+#                     restart_camera_stream(camera_id)
+#                     return  
+#                 continue
 
-            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
-            _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+#             frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))
+#             _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
 
-            if len(frame_buffers[camera_id]) >= 60:
-                frame_buffers[camera_id].pop(0)
+#             if len(frame_buffers[camera_id]) >= 60:
+#                 frame_buffers[camera_id].pop(0)
             
-            frame_buffers[camera_id].append(jpeg.tobytes())
-            last_frame_time = time.time()
+#             frame_buffers[camera_id].append(jpeg.tobytes())
+#             last_frame_time = time.time()
 
-    except Exception as e:
-        logger.error(f"Error in stream for camera {camera_id}: {e}")
-        restart_camera_stream(camera_id)
-    finally:
-        cleanup_camera_stream(camera_id)
+#     except Exception as e:
+#         logger.error(f"Error in stream for camera {camera_id}: {e}")
+#         restart_camera_stream(camera_id)
+#     finally:
+#         cleanup_camera_stream(camera_id)
 
-# -----------------------------------------
-# FUNCTION: Cleanup Camera Process
-# -----------------------------------------
-def cleanup_camera_stream(camera_id):
-    """Stops the camera process and removes buffers safely."""
-    if camera_id in active_streams:
-        pid = active_streams.get(camera_id)
-        if pid:
-            try:
-                os.kill(pid, signal.SIGTERM)
-                logger.info(f"Terminated process {pid} for camera {camera_id}")
-            except ProcessLookupError:
-                logger.warning(f"Process {pid} for camera {camera_id} not found.")
-        active_streams.pop(camera_id, None)
+# # -----------------------------------------
+# # FUNCTION: Cleanup Camera Process
+# # -----------------------------------------
+# def cleanup_camera_stream(camera_id):
+#     """Stops the camera process and removes buffers safely."""
+#     if camera_id in active_streams:
+#         pid = active_streams.get(camera_id)
+#         if pid:
+#             try:
+#                 os.kill(pid, signal.SIGTERM)
+#                 logger.info(f"Terminated process {pid} for camera {camera_id}")
+#             except ProcessLookupError:
+#                 logger.warning(f"Process {pid} for camera {camera_id} not found.")
+#         active_streams.pop(camera_id, None)
 
-    frame_buffers.pop(camera_id, None)
-    logger.info(f"Camera {camera_id} process cleaned up.")
+#     frame_buffers.pop(camera_id, None)
+#     logger.info(f"Camera {camera_id} process cleaned up.")
 
-# -----------------------------------------
-# FUNCTION: Restart Camera Process
-# -----------------------------------------
-def restart_camera_stream(camera_id):
-    """Restarts a camera stream after failure."""
-    logger.info(f"Restarting camera {camera_id}...")
-    time.sleep(2)
-    camera = Camera.objects.filter(id=camera_id).first()
-    if not camera:
-        logger.warning(f"Camera {camera_id} not found. Skipping restart.")
-        return
+# # -----------------------------------------
+# # FUNCTION: Restart Camera Process
+# # -----------------------------------------
+# def restart_camera_stream(camera_id):
+#     """Restarts a camera stream after failure."""
+#     logger.info(f"Restarting camera {camera_id}...")
+#     time.sleep(2)
+#     camera = Camera.objects.filter(id=camera_id).first()
+#     if not camera:
+#         logger.warning(f"Camera {camera_id} not found. Skipping restart.")
+#         return
     
-    # Cleanup old processes if it exists
-    cleanup_camera_stream(camera_id)
+#     # Cleanup old processes if it exists
+#     cleanup_camera_stream(camera_id)
 
-    # Delay restart to prevent rapid looping
-    time.sleep(2)
+#     # Delay restart to prevent rapid looping
+#     time.sleep(2)
 
-    # Restart Camera
-    start_camera_process(camera.id, camera.get_rtsp_url())
+#     # Restart Camera
+#     start_camera_process(camera.id, camera.get_rtsp_url())
 
-# -----------------------------------------
-# DJANGO VIEW: Serve Video Feed
-# -----------------------------------------
-def video_feed(request, camera_id):
-    """Django view for optimized video streaming."""
-    camera = get_object_or_404(Camera, id=camera_id)
-    if camera_id not in active_streams:
-        start_camera_process(camera.id, camera.get_rtsp_url())
-    return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
+# # -----------------------------------------
+# # DJANGO VIEW: Serve Video Feed
+# # -----------------------------------------
+# def video_feed(request, camera_id):
+#     """Django view for optimized video streaming."""
+#     camera = get_object_or_404(Camera, id=camera_id)
+#     if camera_id not in active_streams:
+#         start_camera_process(camera.id, camera.get_rtsp_url())
+#     return StreamingHttpResponse(generate_frames(camera_id), content_type='multipart/x-mixed-replace; boundary=frame')
 
-# -----------------------------------------
-# FUNCTION: Generate Video Feed Frames
-# -----------------------------------------
-def generate_frames(camera_id):
-    """Yields latest frames for HTTP streaming."""
-    while True:
-        if camera_id in frame_buffers and frame_buffers[camera_id]:
-            try:
-                frame = frame_buffers[camera_id][-1]
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n'
-                       b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
-                       b'\r\n' + frame + b'\r\n')
-            except IndexError:
-                yield get_blank_frame()
-            except KeyError:
-                logger.error(f"Frame buffer missing for camera {camera_id}. Retrying...")
-        else:
-            time.sleep(0.5)
+# # -----------------------------------------
+# # FUNCTION: Generate Video Feed Frames
+# # -----------------------------------------
+# def generate_frames(camera_id):
+#     """Yields latest frames for HTTP streaming."""
+#     while True:
+#         if camera_id in frame_buffers and frame_buffers[camera_id]:
+#             try:
+#                 frame = frame_buffers[camera_id][-1]
+#                 yield (b'--frame\r\n'
+#                        b'Content-Type: image/jpeg\r\n'
+#                        b'Content-Length: ' + f"{len(frame)}".encode() + b'\r\n'
+#                        b'\r\n' + frame + b'\r\n')
+#             except IndexError:
+#                 yield get_blank_frame()
+#             except KeyError:
+#                 logger.error(f"Frame buffer missing for camera {camera_id}. Retrying...")
+#         else:
+#             time.sleep(0.5)
 
-# -----------------------------------------
-# FUNCTION: Blank Frame
-# -----------------------------------------
-def get_blank_frame():
-    blank_image = np.zeros((480, 640, 3), dtype=np.uint8)
-    _, jpeg = cv2.imencode(".jpg", blank_image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-    return jpeg.tobytes()
+# # -----------------------------------------
+# # FUNCTION: Blank Frame
+# # -----------------------------------------
+# def get_blank_frame():
+#     blank_image = np.zeros((480, 640, 3), dtype=np.uint8)
+#     _, jpeg = cv2.imencode(".jpg", blank_image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+#     return jpeg.tobytes()
 
-# -----------------------------------------
-# API VIEW: Multi-Camera Streaming
-# -----------------------------------------
-class MultiCameraStreamViewSet(viewsets.ViewSet):
-    """Handles multi-camera streaming for sections."""
-    def retrieve(self, request, pk=None):
-        section = get_object_or_404(Section, id=pk)
-        cameras = Camera.objects.filter(section=section, is_active=True)
-        active_stream_urls = {}
+# # -----------------------------------------
+# # API VIEW: Multi-Camera Streaming
+# # -----------------------------------------
+# class MultiCameraStreamViewSet(viewsets.ViewSet):
+#     """Handles multi-camera streaming for sections."""
+#     def retrieve(self, request, pk=None):
+#         section = get_object_or_404(Section, id=pk)
+#         cameras = Camera.objects.filter(section=section, is_active=True)
+#         active_stream_urls = {}
         
-        if current_section.value != pk:
-            for camera_id in list(active_streams.keys()):
-                cleanup_camera_stream(camera_id)
-            current_section.value = pk
+#         if current_section.value != pk:
+#             for camera_id in list(active_streams.keys()):
+#                 cleanup_camera_stream(camera_id)
+#             current_section.value = pk
         
-        for camera in cameras:
-            if camera.id not in active_streams:
-                start_camera_process(camera.id, camera.get_rtsp_url())
-            active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
+#         for camera in cameras:
+#             if camera.id not in active_streams:
+#                 start_camera_process(camera.id, camera.get_rtsp_url())
+#             active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
 
-        return JsonResponse({"message": "Camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)
+#         return JsonResponse({"message": "Camera feeds", "streams": active_stream_urls}, status=status.HTTP_200_OK)
 
 
 ###########################################################################################################################################################

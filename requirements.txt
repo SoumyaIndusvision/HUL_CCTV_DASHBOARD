@@ -12,3 +12,4 @@ imageio-ffmpeg
 celery
 redis
 django-redis
+psutil

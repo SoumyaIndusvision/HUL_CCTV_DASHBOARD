@@ -299,6 +299,22 @@ class SectionViewSet(viewsets.ViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+def check_camera_status(camera):
+    """
+    Checks whether the camera is currently active by trying to fetch a frame from its RTSP stream.
+    Returns True if the camera is sending frames, otherwise False.
+    """
+    try:
+        cap = cv2.VideoCapture(camera.get_rtsp_url())
+        if cap.isOpened():
+            ret, _ = cap.read()
+            cap.release()
+            return ret  # If ret is True, camera is active
+    except Exception as e:
+        logger.error(f"Error checking camera {camera.id}: {e}")
+    return False  # Camera is inactive
+
+
 class CameraViewSet(viewsets.ViewSet):
     """
     A ViewSet for managing Cameras within Sections.
@@ -358,7 +374,15 @@ class CameraViewSet(viewsets.ViewSet):
             cameras = Camera.objects.all()
 
         serializer = CameraSerializer(cameras, many=True)
-        return Response({"results": serializer.data, "status": status.HTTP_200_OK})
+
+        # Check live status of each camera dynamically
+        for camera_data in serializer.data:
+            camera = Camera.objects.get(pk=camera_data["id"])
+            camera_data["is_active"] = check_camera_status(camera)  # Update is_active based on real-time check
+        
+        data = serializer.data
+
+        return Response({"results": data, "status": status.HTTP_200_OK})
 
     @swagger_auto_schema(
         operation_summary="Retrieve a specific camera",
@@ -390,14 +414,22 @@ class CameraViewSet(viewsets.ViewSet):
     def retrieve(self, request, pk=None):
         try:
             camera = Camera.objects.get(pk=pk)
+            serializer = CameraSerializer(camera)
+
+            # Attach real-time status check
+            data = serializer.data
+            data["is_active"] = check_camera_status(camera)
+
+            return Response({"results": data, "status": status.HTTP_200_OK})
         except Camera.DoesNotExist:
             return Response(
                 {"message": "Camera not found", "status": status.HTTP_404_NOT_FOUND}, 
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        serializer = CameraSerializer(camera)
-        return Response({"results": serializer.data, "status": status.HTTP_200_OK})
+        # serializer = CameraSerializer(camera)
+        # return Response({"results": serializer.data, "status": status.HTTP_200_OK})
+
 
     @swagger_auto_schema(
         operation_summary="Create a new camera",
@@ -615,10 +647,19 @@ class MultiCameraStreamViewSet(viewsets.ViewSet):
 
         # Start new section cameras
         for camera in cameras:
-            if camera.id not in active_streams:
-                start_camera_process(camera.id, camera.get_rtsp_url())
-
-            active_stream_urls[camera.id] = f"/api/video_feed/{camera.id}/"
+            camera_status = check_camera_status(camera)  # Check if the camera is responsive
+            if camera_status:  # Only start if the camera is responsive
+                if camera.id not in active_streams:
+                    start_camera_process(camera.id, camera.get_rtsp_url())
+                active_stream_urls[camera.id] = {
+                    "stream_url": f"/api/video_feed/{camera.id}/",
+                    "is_active": True
+                }
+            else:
+                active_stream_urls[camera.id] = {
+                    "stream_url": None,
+                    "is_active": False
+                }
 
         return JsonResponse(
             {"message": "Camera feeds updated", "streams": active_stream_urls},

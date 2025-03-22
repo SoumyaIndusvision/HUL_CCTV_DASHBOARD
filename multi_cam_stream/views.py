@@ -3,6 +3,8 @@ import cv2
 import time
 import signal
 import logging
+import asyncio
+import aiohttp
 import numpy as np
 import subprocess
 import multiprocessing as mp
@@ -22,8 +24,9 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------
 # Constants
 # -----------------------------------------
-MAX_CONCURRENT_STREAMS = 30
 FRAME_TIMEOUT = 60  # Camera timeout in seconds
+PING_TIMEOUT = 1  # 1-second timeout for ping
+MAX_CONCURRENT_STREAMS = 30
 
 # -----------------------------------------
 # Global Shared State (Using Manager)
@@ -445,6 +448,41 @@ class CameraViewSet(viewsets.ViewSet):
             return Response({"message": "Camera created", "status": status.HTTP_201_CREATED})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
+# ==============================
+#  Camera Health Check Functions
+# ==============================
+
+async def ping_camera(ip):
+    """Asynchronously pings a camera IP to check if it's reachable."""
+    process = await asyncio.create_subprocess_shell(
+        f"ping -c 1 -W {PING_TIMEOUT} {ip}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    await process.communicate()
+    return process.returncode == 0  # Return True if ping succeeds
+
+
+async def check_camera_status(camera):
+    """Check if the camera is active using ping and RTSP connection test."""
+    if not await ping_camera(camera.ip_address):
+        return camera.id, False  # Camera is unreachable via ping
+
+
+async def check_section_cameras(section_id):
+    """Check all cameras in a section concurrently."""
+    section = get_object_or_404(Section, id=section_id)
+    cameras = Camera.objects.filter(section=section)
+
+    tasks = [check_camera_status(camera) for camera in cameras]
+    results = await asyncio.gather(*tasks)
+
+    active_cameras = {camera_id for camera_id, is_active in results if is_active}
+    inactive_cameras = {camera_id for camera_id, is_active in results if not is_active}
+
+    return active_cameras, inactive_cameras
+
 # -----------------------------------------
 # FUNCTION: Start Camera Stream
 # -----------------------------------------
@@ -489,7 +527,7 @@ def stream_camera_ffmpeg(camera_id, camera_url, frame_buffers):
                 if time.time() - last_frame_time > FRAME_TIMEOUT:
                     logger.warning(f"Camera {camera_id} unresponsive. Stopping...")
                     cleanup_camera_stream(camera_id)
-                    break  # 🚀 Ensure the loop exits
+                    break  # Ensure the loop exits
                 continue
 
             frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((480, 640, 3))

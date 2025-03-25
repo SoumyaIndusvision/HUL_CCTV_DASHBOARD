@@ -13,3 +13,4 @@ celery
 redis
 django-redis
 psutil
+gunicorn

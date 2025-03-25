@@ -1,11 +1,12 @@
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import path, include, re_path
 from rest_framework import permissions
 from drf_yasg.views import get_schema_view
 from drf_yasg import openapi
 # from rest_framework_simplejwt.views import TokenRefreshView
 from django.conf import settings
 from django.conf.urls.static import static
+from django.views.static import serve as static_serve
 from django.contrib import admin
 from django.urls import path, include
 from rest_framework import permissions
@@ -35,8 +36,8 @@ urlpatterns = [
 
 
 if settings.DEBUG:
-    # urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
 
-# # Final catch-all pattern to serve index.html for single-page applications
-# urlpatterns += [re_path(r'^.*$', static_serve, {'path': 'multi_stream.html'})]
+# Final catch-all pattern to serve index.html for single-page applications
+urlpatterns += [re_path(r'^.*$', static_serve, {'path': 'multi_stream.html'})]

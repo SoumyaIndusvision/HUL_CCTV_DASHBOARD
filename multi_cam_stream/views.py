@@ -4,7 +4,6 @@ import time
 import signal
 import logging
 import asyncio
-import aiohttp
 import numpy as np
 import subprocess
 import multiprocessing as mp

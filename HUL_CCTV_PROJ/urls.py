@@ -40,4 +40,4 @@ if settings.DEBUG:
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
 
 # Final catch-all pattern to serve index.html for single-page applications
-urlpatterns += [re_path(r'^.*$', static_serve, {'path': 'multi_stream.html'})]
+urlpatterns += [re_path(r'^.*$', static_serve, {'path': 'index.html'})]

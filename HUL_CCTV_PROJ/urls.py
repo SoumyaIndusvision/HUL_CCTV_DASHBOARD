@@ -35,9 +35,9 @@ urlpatterns = [
 ]
 
 
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
+# if settings.DEBUG:
+#     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+#     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
 
 # Final catch-all pattern to serve index.html for single-page applications
-urlpatterns += [re_path(r'^.*$', static_serve, {'path': 'index.html'})]
+# urlpatterns += [re_path(r'^.*$', static_serve, {'path': 'index.html'})]

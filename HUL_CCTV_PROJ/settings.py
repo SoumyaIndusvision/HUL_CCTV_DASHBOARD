@@ -32,6 +32,7 @@ CORS_ALLOW_CREDENTIALS = True  # Allow cookies & authorization headers
 
 # Allowed origins (frontend domains)
 CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
     "http://localhost:5174",  # Local development frontend
     "https://cctv.indusvision.in",  # Production frontend domain
     "https://www.cctv.indusvision.in",  # Alternative production frontend

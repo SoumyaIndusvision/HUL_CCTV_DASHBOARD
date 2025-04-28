@@ -1,66 +1,48 @@
-# import os
-# import time
-# import signal
-# import subprocess
-# import redis
-# from django.core.cache import cache
-# from celery import shared_task
-# from .models import Camera
+import os
+import subprocess
+from django.core.mail import send_mail
+from celery import shared_task
+from .models import Camera  # Import the Camera model
 
-# # Redis Configuration
-# redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
-# FRAME_CACHE_KEY = "camera_frame_{camera_id}"
-# PROCESS_CACHE_KEY = "camera_process_{camera_id}"
-# UDP_PORT = 12345  # Change this port if needed
+# Load environment variables from .env file
+EMAIL_HOST_USER = os.getenv('EMAIL_USER')
+TO_EMAIL = os.getenv('APPLICATION_EMAIL')
 
-# @shared_task(bind=True)
-# def start_camera_stream(self, camera_id):
-#     """Starts a GPU-accelerated camera stream and streams to Redis via UDP."""
-#     camera = Camera.objects.filter(id=camera_id).first()
-#     if not camera:
-#         return f"Camera {camera_id} not found."
+@shared_task
+def ping_cameras_and_send_report():
+    active_cameras = []
+    inactive_cameras = []
 
-#     camera_url = camera.get_rtsp_url()
+    # Fetch the camera IPs from the database (Camera model)
+    camera_ips = Camera.objects.filter(is_active=True).values_list('ip_address', flat=True)
 
-#     # Optimized FFmpeg command for GPU acceleration
-#     ffmpeg_cmd = [
-#         "ffmpeg", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
-#         "-c:v", "h264_cuvid",  # Decode with Nvidia GPU
-#         "-rtsp_transport", "tcp", "-i", camera_url,
-#         "-vf", "fps=15,scale_npp=640:480",  # Ensure proper frame rate and scaling
-#         "-c:v", "h264_nvenc", "-preset", "p4", "-gpu", "0",
-#         "-b:v", "2M", "-bufsize", "4M",
-#         "-f", "mpegts", f"udp://localhost:{UDP_PORT}"
-#     ]
+    # Ping each camera IP
+    for ip in camera_ips:
+        try:
+            # Pinging the camera with 1 packet only (-c 1 for Linux)
+            result = subprocess.run(["ping", "-c", "1", str(ip)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode == 0:
+                active_cameras.append(ip)
+            else:
+                inactive_cameras.append(ip)
+        except Exception as e:
+            inactive_cameras.append(ip)  # Assume inactive if any error occurs
 
-#     process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Compose the email content
+    subject = "Camera Status Report"
+    message = (
+        f"🟢 Active Cameras ({len(active_cameras)}):\n" +
+        "\n".join(active_cameras) +
+        "\n\n" +
+        f"🔴 Inactive Cameras ({len(inactive_cameras)}):\n" +
+        "\n".join(inactive_cameras)
+    )
 
-#     # Store process ID in Redis
-#     cache.set(PROCESS_CACHE_KEY.format(camera_id=camera_id), process.pid)
-
-#     try:
-#         process.wait()  # Keep process running
-#     except Exception as e:
-#         print(f"Camera {camera_id} failed: {e}")
-#         restart_camera_stream.delay(camera_id)
-#     finally:
-#         cleanup_camera_stream(camera_id)
-
-# @shared_task(bind=True)
-# def restart_camera_stream(self, camera_id):
-#     """Restarts the camera stream if it fails."""
-#     cleanup_camera_stream(camera_id)
-#     time.sleep(2)
-#     start_camera_stream.delay(camera_id)
-
-# @shared_task(bind=True)
-# def cleanup_camera_stream(self, camera_id):
-#     """Stops a running camera stream and clears Redis cache."""
-#     process_pid = cache.get(PROCESS_CACHE_KEY.format(camera_id=camera_id))
-#     if process_pid:
-#         try:
-#             os.kill(process_pid, signal.SIGTERM)
-#         except ProcessLookupError:
-#             pass
-
-#         cache.delete(PROCESS_CACHE_KEY.format(camera_id=camera_id))
+    # Send email using Django's email system
+    send_mail(
+        subject=subject,
+        message=message,
+        from_email=EMAIL_HOST_USER,
+        recipient_list=[TO_EMAIL],
+        fail_silently=False,
+    )

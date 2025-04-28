@@ -6,7 +6,7 @@ from .models import Camera  # Import the Camera model
 
 # Load environment variables from .env file
 EMAIL_HOST_USER = os.getenv('EMAIL_USER')
-TO_EMAIL = os.getenv('APPLICATION_EMAIL')
+TO_EMAIL = os.getenv('TO_EMAIL')
 
 @shared_task
 def ping_cameras_and_send_report():

@@ -5,10 +5,10 @@ import pandas as pd
 db_path = '/home/HUL_CCTV_DASHBOARD/db.sqlite3'
 
 # Table you want to export
-table_name = 'multi_cam_stream_camera'  # Use actual table name in your DB
+table_name = 'Cameras'  # Use actual table name in your DB
 
 # Output Excel file name
-output_excel = '/mnt/c/Users/Soumya/Downloads/camera_data.xlsx'
+output_excel = '/mnt/c/Users/Soumya/Downloads/camera_info.xlsx'
 
 # Connect to SQLite and fetch table
 conn = sqlite3.connect(db_path)

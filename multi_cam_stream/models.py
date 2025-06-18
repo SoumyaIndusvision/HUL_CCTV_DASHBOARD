@@ -1,22 +1,28 @@
 from django.db import models
 
 class Seracs(models.Model):
-    name = models.CharField(max_length=100)
-
     class Meta:
-        verbose_name_plural = "Seracs"
-
+        db_table = 'Seracs'
+        verbose_name_plural = 'Seracs'
+        
+    name = models.CharField(max_length=100)
     def __str__(self):
         return self.name
 
 class Section(models.Model):
+    class Meta:
+        db_table = 'Sections'
+        
     name = models.CharField(max_length=100)
     serac = models.ForeignKey(Seracs, related_name='sections', on_delete=models.SET_NULL, null=True)
-
+        
     def __str__(self):
         return f"{self.name} ({self.serac.name})"
 
 class Camera(models.Model):
+    class Meta:
+        db_table = 'Cameras'
+        
     name = models.CharField(max_length=100)
     ip_address = models.GenericIPAddressField()
     port = models.IntegerField(default=554)
